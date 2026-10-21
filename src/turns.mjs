@@ -134,8 +134,24 @@ export function composePrompt(c, role, {site, status, records, claims, rs}) {
   ].filter(Boolean).join('\n\n') + '\n';
 }
 
+// A scheduled check-in (jobs running, nothing new): a short prompt so the agent checks health and stops.
+export function composeCheckinPrompt(c, {status}) {
+  const {paths} = c;
+  const s = status;
+  const jobs = s.jobs.active.map(j => `- \`${j.request}\` job ${j.job_id} ${j.state} (${j.gpus} GPUs): log ${path.join(j.artifacts, `slurm-${j.job_id}.log`)}, outputs in ${j.artifacts}`);
+  return [
+    readText(path.join(HERE, '..', 'prompts', 'worker-checkin.md'), '').trim(),
+    '## Running jobs', ...jobs,
+    '## Context',
+    `- Campaign directory: ${paths.dir}; worktree: ${paths.worktree}`,
+    `- GPUs reserved ${s.budget.reserved}/${s.budget.cap}; queue: ${s.queue.length ? s.queue.map(q => `${q.id} [${q.waiting_for}]`).join(', ') : 'empty'}`,
+    `- Brief: ${paths.brief}; findings: ${paths.findings}; notes: ${paths.notes}; latest report: ${path.join(paths.turns, 'worker-latest.md')}`,
+    ...(s.alerts.length ? ['## Alerts', ...s.alerts.map(a => `- ${a.code}: ${a.message}`)] : []),
+  ].join('\n') + '\n';
+}
+
 // Launch one turn as its own systemd unit so controller restarts never touch it.
-export function launch(c, role, {turns, now, site, systemd, prompt, fingerprint, claimHashes, log, persist}) {
+export function launch(c, role, {turns, now, site, systemd, prompt, fingerprint, claimHashes, log, persist, kind = 'full'}) {
   const rs = turns[role];
   const n = rs.n + 1;
   const name = turnName(role, n);
@@ -144,16 +160,16 @@ export function launch(c, role, {turns, now, site, systemd, prompt, fingerprint,
   const env = {PATH: site.path ?? process.env.PATH, HOME: process.env.HOME, USER: process.env.USER,
     ...(process.env.ARC_CONFIG_DIR ? {ARC_CONFIG_DIR: process.env.ARC_CONFIG_DIR} : {}),
     ...(process.env.ARC_SITE ? {ARC_SITE: process.env.ARC_SITE} : {}),
-    ARC_CAMPAIGN_DIR: c.dir, ARC_ROLE: role};
+    ARC_CAMPAIGN_DIR: c.dir, ARC_ROLE: role, ARC_TURN_KIND: kind};
   // Record the turn before starting it: after a crash in between, harvest finds the unit or counts a failure,
   // and never starts a second turn alongside a running one.
   rs.n = n;
   rs.last_started_at = now;
-  rs.active = {n, unit, started_at: now, fingerprint, claim_hashes: claimHashes};
+  rs.active = {n, unit, started_at: now, fingerprint, claim_hashes: claimHashes, kind};
   persist();
   try {
     systemd.start(unit, [process.execPath, ARC_BIN, 'turn', c.dir, role, String(n)], {cwd: c.paths.worktree, env});
-    log('turn_started', {role, turn: name, unit});
+    log('turn_started', {role, turn: name, unit, kind});
   } catch (err) {
     rs.active = null;
     rs.consecutive_failures += 1; rs.last_finished_at = now; rs.totals.failures += 1;
@@ -178,6 +194,7 @@ export function harvest(c, role, {turns, now, systemd, log}) {
   rs.active = null;
   rs.last_finished_at = now;
   rs.totals.turns += 1;
+  if (a.kind === 'checkin') rs.totals.checkins = (rs.totals.checkins ?? 0) + 1;
   for (const k of ['input_tokens', 'cached_input_tokens', 'output_tokens']) rs.totals[k] += exit.usage?.[k] ?? 0;
   rs.totals.cost_usd += exit.usage?.cost_usd ?? 0;
   if (exit.ok) {
@@ -209,8 +226,10 @@ export const claimHashes = text => Object.fromEntries(parseClaims(text).map(cl =
 // --- The turn runner, executed inside the transient unit: `arc turn <campaign> <role> <n>` ---
 export async function runTurn(campaignDir, role, n) {
   const c = loadCampaign(campaignDir);
-  const rc = c.config[role];
-  if (!rc) throw Error(`role ${role} is not configured`);
+  const roleConfig = c.config[role];
+  if (!roleConfig) throw Error(`role ${role} is not configured`);
+  // A check-in may run with a cheaper model or effort (worker.checkin in campaign.json).
+  const rc = process.env.ARC_TURN_KIND === 'checkin' && roleConfig.checkin ? {...roleConfig, ...roleConfig.checkin} : roleConfig;
   const name = turnName(role, Number(n));
   const base = path.join(c.paths.turns, name);
   const reportFile = `${base}.md`;

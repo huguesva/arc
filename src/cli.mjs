@@ -142,7 +142,7 @@ function statusOne(c, opt) {
   L.push(`  requests ${Object.entries(s.counts).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}`);
   L.push(`  claims ${s.claims.total}: ${s.claims.awaiting_review} awaiting your review, ${s.claims.stale} stale, ${s.claims.audited_unsupported} flagged by the auditor, ${s.claims.accepted} accepted`);
   for (const [role, r] of Object.entries(s.roles)) if (r.configured) {
-    L.push(`  ${role}: ${r.active ? `turn ${r.active.turn} running since ${ageText(r.active.started_at)}` : `idle, next ${r.next_due_at ?? 'on news'}`}; ${r.health}${r.last_error ? ` — ${r.last_error}` : ''}; ${r.totals.turns} turns, ${(r.totals.input_tokens / 1e6).toFixed(1)}M input tokens`);
+    L.push(`  ${role}: ${r.active ? `turn ${r.active.turn} running since ${ageText(r.active.started_at)}` : `idle, next ${r.next_due_at ?? 'on news'}`}; ${r.health}${r.last_error ? ` — ${r.last_error}` : ''}; ${r.totals.turns} turns${r.totals.checkins ? ` (${r.totals.checkins} check-ins)` : ''}, ${(r.totals.input_tokens / 1e6).toFixed(1)}M input tokens`);
   }
   if (s.jobs.active.length) L.push(`  active: ${s.jobs.active.map(j => `${j.request} (${j.job_id} ${j.state})`).join(', ')}`);
   if (s.queue.length) L.push(`  queue: ${s.queue.slice(0, 10).map(q => `${q.id} [${q.waiting_for}]`).join(', ')}${s.queue.length > 10 ? ` … +${s.queue.length - 10}` : ''}`);

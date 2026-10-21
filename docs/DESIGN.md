@@ -96,6 +96,7 @@ The worker never calls Slurm. The controller never decides what to run.
 - `deadline` is required: an ISO time or the literal `"none"`. That makes it a conscious choice, never a default.
 - `advisor`, `evaluator`, `ledger_md`, `study_spool`, `cadence`, `job_prefix` (defaults to `id`) and `job_env` are
   optional.
+- The worker may set `checkin: {model?, effort?, args?}`: overrides used only for scheduled check-ins (§11).
 - Each role may set `bin` (absolute path of the agent CLI, e.g. a wrapper script), `profile`, `effort`, `args` and `env`.
 - `job_env` values are expanded in the job under `set -u`: write `${VAR:-}` for variables that may be unset.
 - Model ids must be exact. A turn whose reported model differs from the configured one fails (no silent substitution).
@@ -289,6 +290,12 @@ and, by default, the code that scores it.
 - Failure backoff: `min(60, 2^consecutive_failures)` minutes after the failed turn. Never permanent. No turn timeouts
   and no turn caps.
 - After the deadline only the first condition applies.
+- **Check-in turns.** When the worker is due only because `busy_min` passed (jobs running, fingerprint unchanged, no
+  failure to retry), it gets a short check-in prompt (`prompts/worker-checkin.md`): the running jobs with their log
+  paths, the budget and queue, and the paths of brief, findings and notes. It checks job health and ends in a few tool
+  calls; only if something is broken does it read the brief and findings and act. `worker.checkin` can make these
+  turns cheaper (lower effort or another model). A turn costs mostly the agent's tool loop, not the prompt, so the
+  saving comes from the short task; nothing is capped.
 - **Advisor** is due when configured, no advisor turn is active, PAUSE_ADVISOR is absent, `every_min` has passed since
   its last start, and some live claim has neither a valid audit nor a text the advisor already answered in a
   successful turn (so a claim it cannot parse is not re-sent forever). New results reach it when the worker updates
@@ -574,3 +581,4 @@ Live campaigns on the legacy controllers are not touched. They finish or drain o
 | 19 | Unit uses `KillMode=mixed`; `arc run` checks it holds the lock; turn units named `arc-<id>.<role>-NNNN` | review of arc v1 |
 | 20 | Adoption always records the study and finishes terminal jobs; a queued request found in the queue is adopted, never resubmitted | review of arc v1 |
 | 21 | Only accepted, rejected, dropped and finished requests wake the worker; a job starting to run does not | user |
+| 22 | Busy-timer wake-ups with no news are short check-in turns, optionally with cheaper settings (worker.checkin) | user |

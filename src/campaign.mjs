@@ -27,13 +27,20 @@ export function paths(dir) {
 
 function checkRole(name, rc, errors, {advisor = false} = {}) {
   if (!rc || typeof rc !== 'object') return errors.push(`${name} must be an object`);
-  const allowed = ['agent', 'model', 'bin', 'profile', 'effort', 'args', 'env', ...(advisor ? ['every_min'] : [])];
+  const allowed = ['agent', 'model', 'bin', 'profile', 'effort', 'args', 'env', ...(advisor ? ['every_min'] : ['checkin'])];
   for (const k of Object.keys(rc)) if (!allowed.includes(k)) errors.push(`${name}.${k} is not a known field`);
   if (!AGENTS.includes(rc.agent)) errors.push(`${name}.agent must be one of ${AGENTS.join(', ')}`);
   if (typeof rc.model !== 'string' || !rc.model) errors.push(`${name}.model is required (exact model id)`);
   for (const k of ['bin', 'profile', 'effort']) if (rc[k] !== undefined && typeof rc[k] !== 'string') errors.push(`${name}.${k} must be a string`);
   if (rc.args !== undefined && (!Array.isArray(rc.args) || rc.args.some(a => typeof a !== 'string'))) errors.push(`${name}.args must be an array of strings`);
   if (rc.env !== undefined && (typeof rc.env !== 'object' || Object.values(rc.env).some(v => typeof v !== 'string'))) errors.push(`${name}.env must map names to strings`);
+  if (rc.checkin !== undefined) {
+    if (typeof rc.checkin !== 'object' || rc.checkin === null) errors.push(`${name}.checkin must be an object`);
+    else for (const [k, v] of Object.entries(rc.checkin)) {
+      if (!['model', 'effort', 'args'].includes(k)) errors.push(`${name}.checkin.${k} is not a known field (model, effort, args)`);
+      else if (k === 'args' ? !Array.isArray(v) || v.some(a => typeof a !== 'string') : typeof v !== 'string') errors.push(`${name}.checkin.${k} has the wrong type`);
+    }
+  }
   if (advisor && rc.every_min !== undefined && !(Number.isInteger(rc.every_min) && rc.every_min >= 1)) errors.push('advisor.every_min must be a positive integer');
 }
 

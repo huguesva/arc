@@ -7,7 +7,7 @@ import {REQUEST_ID_RE, validateRequest, validateInRepo} from './request.mjs';
 import {TERMINAL, ENGINE_FLAGS, realSlurm} from './slurm.mjs';
 import {freeze, studyRecord, ARC_VERSION} from './freeze.mjs';
 import {deadlineMs, loadCampaign, loadSite, resolveCampaignDir, configDir} from './campaign.mjs';
-import {loadTurns, turnsFile, harvest, launch, isDue, composePrompt, workerFingerprint, claimHashes} from './turns.mjs';
+import {loadTurns, turnsFile, harvest, launch, isDue, composePrompt, composeCheckinPrompt, workerFingerprint, claimHashes} from './turns.mjs';
 import {claimStates} from './claims.mjs';
 import {buildStatus} from './status.mjs';
 import {realSystemd} from './systemd.mjs';
@@ -351,8 +351,10 @@ export function tick(ctx) {
     changed: fp !== turns.worker.last_fingerprint, activeJobs, closed, paused: flags.pauseWorker});
   turns.worker.next_due_at = w.next_due_at;
   const persist = () => writeJson(turnsFile(c), turns);
-  if (w.due) launch(c, 'worker', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: fp, log: ctx.log, persist,
-    prompt: composePrompt(c, 'worker', {site: ctx.site, status, records, claims, rs: turns.worker})});
+  // Woken only by the busy timer (jobs running, nothing new, no failure to retry): a short check-in turn.
+  const checkin = fp === turns.worker.last_fingerprint && status.jobs.active.length > 0 && !turns.worker.consecutive_failures;
+  if (w.due) launch(c, 'worker', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: fp, log: ctx.log, persist, kind: checkin ? 'checkin' : 'full',
+    prompt: checkin ? composeCheckinPrompt(c, {status}) : composePrompt(c, 'worker', {site: ctx.site, status, records, claims, rs: turns.worker})});
   if (c.config.advisor) {
     // Claim texts the advisor already answered (successfully) are not re-sent, even if no verdict parsed.
     const answered = new Set(turns.advisor.audited_hashes ?? []);

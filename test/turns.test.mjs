@@ -6,7 +6,7 @@ import {tick} from '../src/controller.mjs';
 import {isDue, loadTurns} from '../src/turns.mjs';
 import {parseClaims, parseVerdicts, claimStates} from '../src/claims.mjs';
 import {main} from '../src/cli.mjs';
-import {tempRepo, makeCampaign, context, status, request, writeRequest, record} from './helpers.mjs';
+import {tempRepo, makeCampaign, context, status, request, writeRequest, record, STUB_AGENT} from './helpers.mjs';
 
 const MIN = 60000;
 const every = {changed: 2, idle: 20, busy: 60};
@@ -225,4 +225,25 @@ test('a job starting to run is not news; a job finishing is', () => {
   ctx.slurm.set(record(c, 'r1').job_id, 'COMPLETED');
   ctx.now += 1 * MIN; tick(ctx); ctx.now += 2 * MIN; tick(ctx);
   assert.equal(ctx.systemd.started.length, after + 1, 'the job finishing does');
+});
+
+test('the hourly wake-up with nothing new is a short check-in, with its own cheaper settings', () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit, pauseWorker: false, config: {worker: {agent: 'claude', model: 'stub-model', bin: STUB_AGENT, checkin: {effort: 'low'}}}});
+  writeRequest(c, request(commit));
+  const ctx = context(c);
+  tick(ctx); ctx.now += 1000; tick(ctx);
+  ctx.now += 3 * MIN; tick(ctx); ctx.now += 1000; tick(ctx); // the accepted submission is news: a full turn
+  const n = loadTurns(c).worker.n;
+  ctx.now += 61 * MIN; tick(ctx); ctx.now += 1000; tick(ctx);
+  const t = loadTurns(c).worker;
+  assert.equal(t.n, n + 1);
+  const prompt = fs.readFileSync(path.join(c.paths.turns, `worker-${String(n + 1).padStart(4, '0')}.prompt.md`), 'utf8');
+  assert.match(prompt, /# Scheduled check-in/);
+  assert.match(prompt, /slurm-\d+\.log/);
+  assert.ok(!prompt.includes('## Request schema'), 'no schema, brief or full findings in a check-in');
+  assert.ok(prompt.length < 4000, `check-in prompt is short (${prompt.length} chars)`);
+  assert.equal(t.totals.checkins, 1);
+  const full = fs.readFileSync(path.join(c.paths.turns, `worker-${String(n).padStart(4, '0')}.prompt.md`), 'utf8');
+  assert.ok(full.includes('## Request schema'), 'news turns stay full');
 });
