@@ -1,0 +1,8 @@
+# Local site policy (cluster accounts, partitions, shared ceilings) never leaves the machine.
+site.mjs
+*.local.*
+.env*
+
+# Runtime data belongs on scratch, never in this repo.
+runs/
+node_modules/
