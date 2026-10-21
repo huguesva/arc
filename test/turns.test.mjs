@@ -210,3 +210,19 @@ test('advisor flag rate: a clean audit is not flagged', async () => {
   tick(ctx); ctx.now += 1000; tick(ctx);
   assert.deepEqual(loadTurns(c).advisor.audits, {total: 1, flagged: 0});
 });
+
+test('a job starting to run is not news; a job finishing is', () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit, pauseWorker: false});
+  writeRequest(c, request(commit));
+  const ctx = context(c);
+  tick(ctx); ctx.now += 1000; tick(ctx); // first turn runs and is harvested; the request is submitted
+  ctx.now += 3 * MIN; tick(ctx); ctx.now += 1000; tick(ctx); // the submission itself is news: one more turn
+  const after = ctx.systemd.started.length;
+  ctx.slurm.set(record(c, 'r1').job_id, 'RUNNING');
+  for (let i = 0; i < 5; i++) { ctx.now += 5 * MIN; tick(ctx); }
+  assert.equal(ctx.systemd.started.length, after, 'PENDING -> RUNNING does not wake the worker');
+  ctx.slurm.set(record(c, 'r1').job_id, 'COMPLETED');
+  ctx.now += 1 * MIN; tick(ctx); ctx.now += 2 * MIN; tick(ctx);
+  assert.equal(ctx.systemd.started.length, after + 1, 'the job finishing does');
+});

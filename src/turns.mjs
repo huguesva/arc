@@ -31,8 +31,13 @@ export const unitName = (c, role, n) => `arc-${c.config.id}.${turnName(role, n)}
 export const unitGlob = id => `arc-${id}.*`;
 const fileHash = p => sha256(readText(p, ''));
 
+// What counts as news for the worker: a request accepted (submitted), rejected, dropped, or a job finishing.
+// Progress in between (queued, held, released, PENDING -> RUNNING) is not news, so a long job costs few turns.
+const NEWS = {submitting: 'accepted', uncertain: 'accepted', submitted: 'accepted', rejected: 'rejected', dropped: 'dropped'};
+const newsOf = r => (r.status === 'finished' ? `finished:${r.slurm_state}` : NEWS[r.status] ?? null);
+
 export function workerFingerprint(c, records) {
-  const rows = records.map(r => [r.id, r.status, r.slurm_state ?? null, r.released ?? null]).sort((a, b) => a[0].localeCompare(b[0]));
+  const rows = records.map(r => [r.id, newsOf(r)]).filter(([, n]) => n).sort((a, b) => a[0].localeCompare(b[0]));
   return sha256(JSON.stringify([rows, fileHash(c.paths.brief), fileHash(c.paths.steering),
     fileHash(path.join(c.paths.turns, 'advisor-latest.md')), fileHash(c.paths.reviews)]));
 }

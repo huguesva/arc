@@ -278,8 +278,10 @@ and, by default, the code that scores it.
 
 **Cadence.**
 
-- Worker fingerprint = hash of (record id, status, slurm state, released) for all requests, `brief.md`,
-  `steering.md` and the latest advisor verdict.
+- Worker fingerprint = hash of the news state of every request (accepted, rejected, dropped, or finished with its
+  final Slurm state), `brief.md`, `steering.md`, the latest advisor report and the human reviews. Progress in between
+  (queued, held, released, PENDING → RUNNING) is not news, so a long job costs about two turns plus the `busy_min`
+  check-ins.
 - **Worker** is due when no worker turn is active, PAUSE_WORKER is absent, and at least one holds:
   - the fingerprint changed since the last turn started, and `changed_min` has passed;
   - no job is active and `idle_min` has passed;
@@ -571,3 +573,4 @@ Live campaigns on the legacy controllers are not touched. They finish or drain o
 | 18 | Advisor re-runs only for claim texts it has not answered; prompt carries per-request evidence; read-only git for the Claude advisor | review of arc v1 |
 | 19 | Unit uses `KillMode=mixed`; `arc run` checks it holds the lock; turn units named `arc-<id>.<role>-NNNN` | review of arc v1 |
 | 20 | Adoption always records the study and finishes terminal jobs; a queued request found in the queue is adopted, never resubmitted | review of arc v1 |
+| 21 | Only accepted, rejected, dropped and finished requests wake the worker; a job starting to run does not | user |
