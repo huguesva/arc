@@ -264,7 +264,9 @@ test('run.sh: scheduler commands are shadowed even when hidden from the static s
   const r = spawnSync('bash', [path.join(out, 'run.sh')], {encoding: 'utf8', env: {...process.env, SLURM_JOB_ID: '1', SLURM_CPUS_PER_TASK: '2'}});
   assert.equal(r.status, 97);
   assert.match(r.stderr, /blocked inside campaign jobs/);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(out, 'execution.json'))).exit_code, 97);
+  const failed = JSON.parse(fs.readFileSync(path.join(out, 'execution.json')));
+  assert.equal(failed.exit_code, 97);
+  assert.deepEqual(failed.outputs, [{path: 'metrics.json', missing: true}]);
   assert.ok(fs.existsSync(path.join(out, 'source', 'experiments', 'sneaky.sh')), 'source extracted by the job');
 });
 
@@ -278,7 +280,11 @@ test('run.sh runs the frozen script and records its outputs', () => {
   const r = spawnSync('bash', [path.join(out, 'run.sh')], {encoding: 'utf8', env: {...process.env, SLURM_JOB_ID: '5'}});
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(out, 'metrics.json'))), {val_loss: 1});
-  assert.equal(JSON.parse(fs.readFileSync(path.join(out, 'execution.json'))).job_id, '5');
+  const exec = JSON.parse(fs.readFileSync(path.join(out, 'execution.json')));
+  assert.equal(exec.job_id, '5');
+  const metrics = fs.readFileSync(path.join(out, 'metrics.json'));
+  const sha256 = execFileSync('sha256sum', [path.join(out, 'metrics.json')], {encoding: 'utf8'}).split(' ')[0];
+  assert.deepEqual(exec.outputs, [{path: 'metrics.json', sha256, bytes: metrics.length}]);
 });
 
 test('status has the fixed schema', () => {

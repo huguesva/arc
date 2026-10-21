@@ -23,8 +23,9 @@ Answer this checklist from the evidence, not from the worker's wording:
 6. Could test data have leaked into training or selection?
 
 Where to look: `artifacts/<request>/` holds `request.json`, `provenance.json`, `execution.json`, `slurm-<job>.log` and
-the outputs. `state/requests/<request>.json` holds the controller's record. Use `git show <commit>` and `git diff` in
-the worktree for code.
+the outputs; `execution.json` lists the hash each expected output had when the job ended.
+`state/requests/<request>.json` holds the controller's record. Use `git show <commit>` and `git diff` in the worktree
+for code.
 
 ## Output: exactly this shape
 
