@@ -46,12 +46,12 @@ The worker never calls Slurm. The controller never decides what to run.
 <runs_root>/<id>/                       one campaign (runs_root from site.mjs, on scratch)
   campaign.json  brief.md  steering.md  human
   control/  STOP  PAUSE_SUBMISSIONS  PAUSE_WORKER  PAUSE_ADVISOR  priority.json  reviews.jsonl
-                                        human, via the CLI
+            reconcile/<request>.json    human, via the CLI (reconcile commands are applied once, then renamed)
   requests/<id>.json                    worker, create-only
   withdraw/<id>                         worker or `arc withdraw`; content = reason
   findings.md  notes.md  blocked.md     worker
   worktree/                             worker; git worktree on branch arc/<id>
-  state/<request>.json                  controller: one record per request
+  state/requests/<request>.json         controller: one record per request
   state/turns.json                      controller: turn bookkeeping
   state/claims.json                     controller: parsed claims, audit verdicts, review validity
   artifacts/<request>/                  controller, then the job:
@@ -88,6 +88,7 @@ The worker never calls Slurm. The controller never decides what to run.
 - `deadline` is required: an ISO time or the literal `"none"`. That makes it a conscious choice, never a default.
 - `advisor`, `evaluator`, `ledger_md`, `study_spool`, `cadence`, `job_prefix` (defaults to `id`) and `job_env` are
   optional.
+- Each role may set `bin` (absolute path of the agent CLI, e.g. a wrapper script), `profile`, `effort`, `args` and `env`.
 - Model ids must be exact. A turn whose reported model differs from the configured one fails (no silent substitution).
 - `brief.md`: objective, baseline, evaluation protocol, budget and deadline in prose. Stable.
 - `steering.md`: append-only dated entries, `## 2026-10-21T16:09Z — title`, written by `arc steer` or by hand. Read
@@ -220,7 +221,8 @@ Each tick:
   - Exactly one match: adopt it as `submitted` (released or not, as Slurm reports).
   - Otherwise `submitting` becomes `uncertain`; it is re-checked every tick.
   - An uncertain request keeps its GPUs reserved and blocks only itself. It is never resubmitted.
-  - A human resolves it with `arc reconcile <id> --adopt <job>` or `--abandon` (which makes it `dropped`).
+  - A human resolves it with `arc reconcile <id> --adopt <job>` or `--abandon` (which makes it `dropped`). The command
+    is written to `control/reconcile/` and applied by the controller on its next tick, so `state/` keeps one writer.
 - **Release.** `submitted` and not released: write the study if missing, then release.
 - **Orphans.** Jobs in `squeue --me` whose comment starts with `arc:<campaign>:` but match no record's job id
   count toward `reserved` (GPUs parsed from `%b × %D`) and raise `orphan_job`.
@@ -396,6 +398,7 @@ per-job review queue does not scale. One legacy notebook reached 15,000+ unticke
 ## 15. CLI
 
 ```
+arc init <id> --repo <path>   new campaign directory from templates (in runs_root), base_commit = repo HEAD
 arc start <dir|id>            validate config, files, site, agent binaries and scheduler access; create dirs and
                               worktree (git worktree add <dir>/worktree -b arc/<id> <base_commit>); register;
                               install the unit; clear STOP; enable; wait for a heartbeat; print a summary.

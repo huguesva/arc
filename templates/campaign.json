@@ -1,0 +1,11 @@
+{
+  "id": "warmup-study",
+  "repo": "/path/to/your/project",
+  "base_commit": "0000000000000000000000000000000000000000",
+  "gpu_cap": 16,
+  "deadline": "none",
+  "job_prefix": "ws",
+  "job_env": {"PYTHONPATH": "$ARC_SOURCE/src:$ARC_SOURCE"},
+  "worker": {"agent": "codex", "model": "MODEL_ID", "effort": "high"},
+  "advisor": {"agent": "claude", "model": "MODEL_ID", "every_min": 60}
+}

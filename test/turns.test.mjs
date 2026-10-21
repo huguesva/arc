@@ -1,0 +1,175 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import {tick} from '../src/controller.mjs';
+import {isDue, loadTurns} from '../src/turns.mjs';
+import {parseClaims, parseVerdicts, claimStates} from '../src/claims.mjs';
+import {main} from '../src/cli.mjs';
+import {tempRepo, makeCampaign, context, status, request, writeRequest, record} from './helpers.mjs';
+
+const MIN = 60000;
+const every = {changed: 2, idle: 20, busy: 60};
+
+test('cadence: news after 2 min, idle 20 min, busy 60 min, backoff on failure, deadline only on news', () => {
+  const rs = {active: null, last_started_at: 0, last_finished_at: 0, consecutive_failures: 0};
+  const due = (o) => isDue({rs: {...rs, ...o.rs}, now: o.now, every, changed: o.changed ?? false, activeJobs: o.activeJobs ?? false, closed: o.closed ?? false, paused: false}).due;
+  assert.equal(due({now: 1 * MIN, changed: true}), false);
+  assert.equal(due({now: 2 * MIN, changed: true}), true);
+  assert.equal(due({now: 19 * MIN}), false);
+  assert.equal(due({now: 20 * MIN}), true);
+  assert.equal(due({now: 59 * MIN, activeJobs: true}), false);
+  assert.equal(due({now: 60 * MIN, activeJobs: true}), true);
+  assert.equal(due({now: 600 * MIN, closed: true}), false, 'after the deadline only news wakes the worker');
+  assert.equal(due({now: 600 * MIN, closed: true, changed: true}), true);
+  assert.equal(due({now: 3 * MIN, rs: {consecutive_failures: 2, last_finished_at: 0}}), false, 'backoff 4 min after 2 failures');
+  assert.equal(due({now: 4 * MIN, rs: {consecutive_failures: 2, last_finished_at: 0}}), true);
+  assert.equal(due({now: 59 * MIN, rs: {consecutive_failures: 9, last_finished_at: 0}}), false, 'backoff caps at 60 min');
+  assert.equal(due({now: 60 * MIN, rs: {consecutive_failures: 9, last_finished_at: 0}}), true, 'never gives up');
+  assert.equal(due({now: 999 * MIN, rs: {active: {n: 1}}}), false, 'one turn at a time');
+});
+
+test('worker turn runs through the real turn runner and is harvested', () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit, pauseWorker: false});
+  const ctx = context(c);
+  tick(ctx); // launches (fake systemd runs it synchronously)
+  assert.equal(ctx.systemd.started.length, 1);
+  const prompt = fs.readFileSync(path.join(c.paths.turns, 'worker-0001.prompt.md'), 'utf8');
+  for (const part of ['## Request schema', '## Cluster rules', '## Brief', '## Steering', '## Live status']) assert.ok(prompt.includes(part), part);
+  ctx.now += 1000; tick(ctx); // harvest
+  const t = loadTurns(c);
+  assert.equal(t.worker.consecutive_failures, 0);
+  assert.equal(t.worker.totals.turns, 1);
+  assert.equal(t.worker.totals.input_tokens, 100);
+  assert.equal(fs.readFileSync(path.join(c.paths.turns, 'worker-latest.md'), 'utf8').trim(), 'worker turn done');
+  ctx.now += 1 * MIN; tick(ctx);
+  assert.equal(ctx.systemd.started.length, 1, 'no news: no new turn');
+  fs.appendFileSync(c.paths.steering, '\n## 2026-10-22T00:05Z — focus\n\nTry warmup 2k.\n');
+  ctx.now += 2 * MIN; tick(ctx);
+  assert.equal(ctx.systemd.started.length, 2, 'steering is news');
+});
+
+test('provider failures are visible, back off, and never stop retrying', () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit, pauseWorker: false});
+  fs.writeFileSync(path.join(c.dir, 'stub-mode'), 'fail');
+  const ctx = context(c);
+  for (let i = 0; i < 3; i++) { tick(ctx); ctx.now += 1000; tick(ctx); ctx.now += 61 * MIN; }
+  const s = status(c);
+  assert.equal(s.roles.worker.consecutive_failures, 3);
+  assert.match(s.roles.worker.last_error, /out of credits/);
+  assert.ok(s.alerts.some(a => a.code === 'role_failing' && /out of credits/.test(a.message)));
+  fs.rmSync(path.join(c.dir, 'stub-mode'));
+  tick(ctx); ctx.now += 1000; tick(ctx);
+  assert.equal(status(c).roles.worker.consecutive_failures, 0);
+  assert.ok(!status(c).alerts.some(a => a.code === 'role_failing'), 'alert clears itself');
+});
+
+const FINDINGS = `# Question
+Does warmup help?
+
+## Claims
+
+### C1 — 2k warmup lowers val loss by 0.03
+Evidence: warmup-2k-seed1..3 vs warmup-500-seed1..3
+Evaluator: unmodified
+Variants tried: 2
+
+### C2 — LR above 3e-3 diverges
+Evidence: lr-sweep
+Variants tried: 5
+
+## Superseded
+
+### C0 — warmup has no effect
+Retracted after seed 3.
+`;
+
+test('claims parse with stable ids, hashes and a superseded section', () => {
+  const claims = parseClaims(FINDINGS);
+  assert.deepEqual(claims.map(c => [c.id, c.superseded]), [['C1', false], ['C2', false], ['C0', true]]);
+  assert.match(claims[0].title, /2k warmup/);
+  assert.notEqual(claims[0].hash, claims[1].hash);
+  assert.deepEqual(parseVerdicts('C1: supported — matches metrics.json\n- C2: unsupported — only one seed\nMaterial issues: none'),
+    {C1: {verdict: 'supported', detail: 'matches metrics.json'}, C2: {verdict: 'unsupported', detail: 'only one seed'}});
+});
+
+test('advisor audits claims; human review binds to the claim text; an edit makes it stale', async () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit, config: {advisor: {agent: 'claude', model: 'stub-model', bin: (await import('./helpers.mjs')).STUB_AGENT, every_min: 30}}});
+  fs.writeFileSync(c.paths.findings, FINDINGS);
+  fs.writeFileSync(path.join(c.dir, 'stub-report-advisor'), 'C1: supported — matches metrics.json\nC2: unsupported — one seed only\nMaterial issues:\n- C2 rests on a single seed (lr-sweep/metrics.json)');
+  const ctx = context(c);
+  tick(ctx); ctx.now += 1000; tick(ctx);
+  const prompt = fs.readFileSync(path.join(c.paths.turns, 'advisor-0001.prompt.md'), 'utf8');
+  assert.ok(prompt.includes('## Claims to audit (2)'));
+  let states = Object.fromEntries(claimStates(c).map(x => [x.id, x]));
+  assert.equal(states.C1.state, 'audited');
+  assert.equal(states.C1.audit.verdict, 'supported');
+  assert.equal(states.C2.audit.verdict, 'unsupported');
+  assert.equal(status(c).claims.audited_unsupported, 1);
+  ctx.now += 31 * MIN; tick(ctx);
+  assert.equal(loadTurns(c).advisor.n, 1, 'nothing new to audit: advisor does not run');
+
+  const log = console.log; console.log = () => {};
+  try { await main(['review', c.dir, 'C1', 'accept', '-m', 'checked seeds']); } finally { console.log = log; }
+  states = Object.fromEntries(claimStates(c).map(x => [x.id, x]));
+  assert.equal(states.C1.state, 'reviewed:accept');
+  fs.writeFileSync(c.paths.findings, FINDINGS.replace('0.03', '0.05'));
+  states = Object.fromEntries(claimStates(c).map(x => [x.id, x]));
+  assert.equal(states.C1.state, 'stale', 'review no longer matches the edited claim');
+  assert.equal(states.C1.audit, null, 'audit no longer matches either');
+});
+
+test('cli: steer, pause, withdraw, priority, reconcile write only human-owned files', async () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit});
+  const log = console.log; console.log = () => {};
+  try {
+    await main(['steer', c.dir, '-m', 'Drop the 4k arm.']);
+    await main(['pause', c.dir, 'submissions']);
+    await main(['priority', c.dir, 'r1', '3']);
+    await main(['withdraw', c.dir, 'r9', '-m', 'duplicate']);
+    await main(['reconcile', c.dir, 'r1', '--abandon']);
+  } finally { console.log = log; }
+  assert.match(fs.readFileSync(c.paths.steering, 'utf8'), /## \d{4}-\d\d-\d\dT\d\d:\d\dZ — Drop the 4k arm\.\n\nDrop the 4k arm\./);
+  assert.ok(fs.existsSync(path.join(c.paths.control, 'PAUSE_SUBMISSIONS')));
+  assert.deepEqual(JSON.parse(fs.readFileSync(c.paths.priority)), {r1: 3});
+  assert.equal(fs.readFileSync(path.join(c.paths.withdraw, 'r9'), 'utf8').trim(), 'duplicate');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(c.paths.reconcile, 'r1.json'))).action, 'abandon');
+  writeRequest(c, request(commit));
+  const ctx = context(c);
+  tick(ctx);
+  assert.equal(record(c, 'r1').status, 'queued');
+  assert.equal(status(c).queue[0].waiting_for, 'paused');
+});
+
+test('cli: check-request validates schema and, with a campaign, the commit and script', async () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit});
+  const file = path.join(c.dir, 'r1.json');
+  const lines = []; const log = console.log; console.log = s => lines.push(s);
+  try {
+    fs.writeFileSync(file, JSON.stringify(request(commit)));
+    assert.equal(await main(['check-request', file, '--campaign', c.dir]), 0);
+    fs.writeFileSync(file, JSON.stringify(request(commit, {script: 'nope.sh'})));
+    assert.equal(await main(['check-request', file, '--campaign', c.dir]), 1);
+  } finally { console.log = log; }
+  assert.match(lines.join('\n'), /not committed/);
+});
+
+test('cli: init creates a campaign from the templates with the repo HEAD as base commit', async () => {
+  const {repo, commit} = tempRepo();
+  const cfg = (await import('./helpers.mjs')).tempDir('arc-config-');
+  const root = (await import('./helpers.mjs')).tempDir('arc-runs-');
+  fs.writeFileSync(path.join(cfg, 'site.mjs'), `export const runs_root = ${JSON.stringify(root)};\nexport function route() { return {args: []}; }\n`);
+  const prev = process.env.ARC_CONFIG_DIR; process.env.ARC_CONFIG_DIR = cfg;
+  const log = console.log; console.log = () => {};
+  try { assert.equal(await main(['init', 'new-study', '--repo', repo]), 0); }
+  finally { console.log = log; if (prev === undefined) delete process.env.ARC_CONFIG_DIR; else process.env.ARC_CONFIG_DIR = prev; }
+  const config = JSON.parse(fs.readFileSync(path.join(root, 'new-study', 'campaign.json')));
+  assert.equal(config.id, 'new-study');
+  assert.equal(config.base_commit, commit);
+  assert.ok(fs.existsSync(path.join(root, 'new-study', 'brief.md')));
+});

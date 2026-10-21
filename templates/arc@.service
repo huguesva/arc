@@ -1,0 +1,15 @@
+[Unit]
+Description=arc campaign %i
+
+[Service]
+Type=simple
+ExecStart={{FLOCK}} --no-fork --nonblock {{CONFIG}}/locks/%i.lock {{NODE}} {{ARC}} run %i
+Restart=on-failure
+RestartSec=30
+UMask=0077
+Environment=ARC_CONFIG_DIR={{CONFIG}}
+Environment=PATH={{PATH}}
+{{SITE}}
+
+[Install]
+WantedBy=default.target

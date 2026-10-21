@@ -1,0 +1,16 @@
+{
+  "name": "arc",
+  "version": "0.1.0",
+  "description": "Autonomous Research Controller: a small harness for autonomous research campaigns on Slurm",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "arc": "bin/arc"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
