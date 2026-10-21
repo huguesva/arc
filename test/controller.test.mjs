@@ -55,8 +55,9 @@ test('crash after sbatch created the job: restart adopts it, no duplicate', () =
   writeRequest(c, request(commit));
   const ctx = context(c);
   ctx.slurm.plan.push('crash-after-create');
-  assert.throws(() => tick(ctx), /simulated controller crash/);
+  tick(ctx); // the failure stays inside the admit phase; the intent is left unresolved, as after a real crash
   assert.equal(record(c, 'r1').status, 'submitting');
+  assert.ok(status(c).alerts.some(a => a.code === 'controller_error' && /simulated controller crash/.test(a.message)));
   tick(ctx);
   const rec = record(c, 'r1');
   assert.equal(rec.status, 'submitted');
@@ -318,4 +319,73 @@ test('a half-written request file is retried, not rejected, while it is fresh', 
   writeRequest(c, request(commit));
   ctx.now = Date.now(); tick(ctx);
   assert.equal(record(c, 'r1').status, 'submitted');
+});
+
+test('a request larger than the GPU budget is rejected instead of blocking the queue forever', () => {
+  const {c, commit} = setup({gpu_cap: 4});
+  writeRequest(c, request(commit, {id: 'huge', gpus: 8, priority: 9}));
+  writeRequest(c, request(commit, {id: 'small', gpus: 1}));
+  tick(context(c));
+  assert.equal(record(c, 'huge').status, 'rejected');
+  assert.match(record(c, 'huge').reason, /never fit/);
+  assert.equal(record(c, 'small').status, 'submitted');
+});
+
+test('a scheduler outage stops admission but not status or the rest of the tick', () => {
+  const {c, commit} = setup();
+  writeRequest(c, request(commit));
+  const ctx = context(c);
+  const queue = ctx.slurm.queue;
+  ctx.slurm.queue = () => { throw Object.assign(new Error('squeue: error: Socket timed out'), {stderr: 'Socket timed out'}); };
+  tick(ctx);
+  assert.equal(record(c, 'r1').status, 'queued', 'no admission without a fresh view of the queue');
+  assert.ok(status(c).alerts.some(a => a.code === 'controller_error'));
+  ctx.slurm.queue = queue;
+  tick(ctx);
+  assert.equal(record(c, 'r1').status, 'submitted');
+  assert.ok(!status(c).alerts.some(a => a.code === 'controller_error'), 'clears on the next good tick');
+});
+
+test('a job found only in accounting (already finished) is adopted, recorded and finished, never stuck', () => {
+  const {c, commit} = setup();
+  writeRequest(c, request(commit, {id: 'train', gpus: 1}));
+  writeRequest(c, request(commit, {id: 'eval', gpus: 1, after: ['train']}));
+  const ctx = context(c);
+  ctx.slurm.plan.push('crash-after-create');
+  tick(ctx);
+  const job = [...ctx.slurm.jobs.values()][0];
+  ctx.slurm.set(job.id, 'CANCELLED'); // e.g. a human cancelled the held job while the controller was down
+  tick(ctx);
+  const rec = record(c, 'train');
+  assert.equal(rec.status, 'finished');
+  assert.equal(rec.slurm_state, 'CANCELLED');
+  assert.ok(fs.existsSync(path.join(c.paths.artifacts, 'train', 'study.json')), 'study written on adoption');
+  tick(ctx);
+  assert.equal(record(c, 'eval').status, 'dropped', 'dependents resolve instead of waiting forever');
+});
+
+test('a queued request whose token is already in the queue is adopted, not submitted twice', () => {
+  const {c, commit} = setup();
+  writeRequest(c, request(commit));
+  const ctx = context(c);
+  ctx.slurm.plan.push('definite');
+  tick(ctx);
+  assert.equal(record(c, 'r1').status, 'queued');
+  // the "definite" error was wrong: a job exists after all
+  ctx.slurm.jobs.set('555', {id: '555', name: 'test-campaign-r1', comment: 'arc:test-campaign:r1', state: 'PENDING', held: true, gpus: 2});
+  ctx.now += 10 * MIN; tick(ctx);
+  assert.equal(record(c, 'r1').job_id, '555');
+  assert.equal(ctx.slurm.jobs.size, 1);
+  assert.equal(ctx.slurm.jobs.get('555').held, false);
+});
+
+test('a job still held after a release is released again', () => {
+  const {c, commit} = setup();
+  writeRequest(c, request(commit));
+  const ctx = context(c);
+  tick(ctx);
+  const id = record(c, 'r1').job_id;
+  ctx.slurm.jobs.get(id).held = true; // e.g. a release that silently did not take
+  tick(ctx);
+  assert.equal(ctx.slurm.jobs.get(id).held, false);
 });

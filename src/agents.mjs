@@ -2,7 +2,8 @@
 import {readText} from './fsutil.mjs';
 
 const WORKER_TOOLS = 'Bash,Read,Edit,Write,Glob,Grep';
-const ADVISOR_TOOLS = 'Read,Glob,Grep';
+const ADVISOR_TOOLS = 'Read,Glob,Grep,Bash';
+const ADVISOR_ALLOWED = 'Read,Glob,Grep,Bash(git show:*),Bash(git diff:*),Bash(git log:*)'; // read-only git only
 
 export function agentCommand(role, rc, {worktree, campaignDir, reportFile, gitDir}) {
   const readOnly = role === 'advisor';
@@ -15,8 +16,8 @@ export function agentCommand(role, rc, {worktree, campaignDir, reportFile, gitDi
   }
   const tools = readOnly ? ADVISOR_TOOLS : WORKER_TOOLS;
   const args = ['--print', '--output-format', 'stream-json', '--verbose', '--no-session-persistence', '--model', rc.model,
-    ...(rc.effort ? ['--effort', rc.effort] : []), '--permission-mode', 'dontAsk', '--tools', tools, '--allowedTools', tools,
-    '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--add-dir', campaignDir, ...(gitDir && !readOnly ? ['--add-dir', gitDir] : []), ...(rc.args ?? [])];
+    ...(rc.effort ? ['--effort', rc.effort] : []), '--permission-mode', 'dontAsk', '--tools', tools, '--allowedTools', readOnly ? ADVISOR_ALLOWED : tools,
+    '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--add-dir', campaignDir, ...(gitDir ? ['--add-dir', gitDir] : []), ...(rc.args ?? [])];
   return {bin: rc.bin ?? 'claude', args};
 }
 

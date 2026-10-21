@@ -5,7 +5,19 @@
   "gpu_cap": 16,
   "deadline": "none",
   "job_prefix": "ws",
-  "job_env": {"PYTHONPATH": "$ARC_SOURCE/src:$ARC_SOURCE"},
-  "worker": {"agent": "codex", "model": "MODEL_ID", "effort": "high"},
-  "advisor": {"agent": "claude", "model": "MODEL_ID", "every_min": 60}
+  "job_env": {
+    "PYTHONPATH": "$ARC_SOURCE/src:$ARC_SOURCE",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  },
+  "worker": {
+    "agent": "codex",
+    "model": "MODEL_ID",
+    "effort": "high"
+  },
+  "advisor": {
+    "agent": "claude",
+    "model": "MODEL_ID",
+    "every_min": 60
+  }
 }

@@ -8,6 +8,7 @@ import {agentCommand, parseTranscript} from './agents.mjs';
 import {parseVerdicts, parseClaims} from './claims.mjs';
 import {schemaText} from './request.mjs';
 import {loadCampaign} from './campaign.mjs';
+import {git} from './git.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ARC_BIN = path.join(HERE, '..', 'bin', 'arc');
@@ -25,7 +26,9 @@ export function loadTurns(c) {
   return t;
 }
 export const turnName = (role, n) => `${role}-${String(n).padStart(4, '0')}`;
-export const unitName = (c, role, n) => `arc-${c.config.id}-${turnName(role, n)}`;
+// '.' cannot appear in a campaign id, so arc-<id>.* never matches another campaign's units.
+export const unitName = (c, role, n) => `arc-${c.config.id}.${turnName(role, n)}`;
+export const unitGlob = id => `arc-${id}.*`;
 const fileHash = p => sha256(readText(p, ''));
 
 export function workerFingerprint(c, records) {
@@ -56,13 +59,25 @@ function recentRejections(records, sinceMs) {
   return records.filter(r => r.status === 'rejected' && Date.parse(r.updated_at) > sinceMs).map(r => `- \`${r.id}\`: ${r.reason}`);
 }
 
+// For each request id cited by a claim: the controller's record and the code change behind it.
+function evidenceLines(c, claims, records) {
+  const ids = new Set(records.map(r => r.id));
+  const cited = [...new Set(claims.flatMap(cl => cl.text.match(/[a-z][a-z0-9-]*/g) ?? []).filter(w => ids.has(w)))].slice(0, 30);
+  return cited.map(id => {
+    const r = records.find(x => x.id === id);
+    let stat = '';
+    try { stat = git(c.config.repo, ['diff', '--shortstat', c.config.base_commit, r.request.source_commit], {timeout: 30000}).trim(); } catch { stat = 'diff unavailable'; }
+    return `- \`${id}\`: ${r.status}${r.slurm_state ? ` ${r.slurm_state}` : ''}${r.exit_code ? ` exit ${r.exit_code}` : ''}, job ${r.job_id ?? '-'}, commit ${r.request?.source_commit ?? '-'} (vs base: ${stat || 'no change'}), evaluator ${r.evaluator_status ?? 'not pinned'}, artifacts ${path.join(c.paths.artifacts, id)}`;
+  });
+}
+
 export function digest(c, role, {status, records, claims, rs}) {
   const out = [];
   const s = status;
   out.push(`## Live status (${s.generated_at})`,
     `Phase: ${s.controller.phase}. GPUs reserved ${s.budget.reserved}/${s.budget.cap} (free ${s.budget.free}). Deadline: ${s.deadline.at ?? 'none'}${s.deadline.closed ? ' (CLOSED: no new submissions)' : ''}.`);
   if (s.alerts.length) out.push('Alerts:', ...s.alerts.map(a => `- ${a.code}: ${a.message}`));
-  if (s.queue.length) out.push('Queue (in admission order):', ...s.queue.slice(0, 40).map(q => `- \`${q.id}\` priority ${q.priority}: waiting for ${q.waiting_for}`));
+  if (s.queue.length) out.push('Queue (in admission order):', ...s.queue.slice(0, 40).map(q => `- \`${q.id}\` priority ${q.priority}: waiting for ${q.waiting_for}${q.last_error ? ` (last error: ${q.last_error.slice(0, 300)})` : ''}`));
   if (s.jobs.active.length) out.push('Active jobs:', ...s.jobs.active.map(j => `- \`${j.request}\` job ${j.job_id ?? '?'} ${j.state} (${j.gpus} GPUs)`));
   if (s.jobs.recent.length) out.push('Recently finished:', ...s.jobs.recent.map(j => `- \`${j.request}\` job ${j.job_id} ${j.state} exit ${j.exit ?? '?'} → ${j.artifacts}`));
   const rej = recentRejections(records, rs.last_started_at);
@@ -81,6 +96,8 @@ export function digest(c, role, {status, records, claims, rs}) {
   } else {
     const toAudit = claims.filter(cl => !cl.superseded && !cl.audit);
     out.push(`## Claims to audit (${toAudit.length})`, toAudit.length ? toAudit.map(cl => cl.text).join('\n\n') : 'None changed since your last audit.');
+    const evidence = evidenceLines(c, toAudit, records);
+    if (evidence.length) out.push('## Evidence for the cited requests (controller records)', ...evidence);
     out.push('## Full findings.md for context', findings || '(empty)');
   }
   out.push(`## Your health`, `Consecutive failures: ${rs.consecutive_failures}${rs.last_error ? `; last error: ${rs.last_error}` : ''}.`);
@@ -113,7 +130,7 @@ export function composePrompt(c, role, {site, status, records, claims, rs}) {
 }
 
 // Launch one turn as its own systemd unit so controller restarts never touch it.
-export function launch(c, role, {turns, now, site, systemd, prompt, fingerprint, claimHashes, log}) {
+export function launch(c, role, {turns, now, site, systemd, prompt, fingerprint, claimHashes, log, persist}) {
   const rs = turns[role];
   const n = rs.n + 1;
   const name = turnName(role, n);
@@ -123,13 +140,17 @@ export function launch(c, role, {turns, now, site, systemd, prompt, fingerprint,
     ...(process.env.ARC_CONFIG_DIR ? {ARC_CONFIG_DIR: process.env.ARC_CONFIG_DIR} : {}),
     ...(process.env.ARC_SITE ? {ARC_SITE: process.env.ARC_SITE} : {}),
     ARC_CAMPAIGN_DIR: c.dir, ARC_ROLE: role};
+  // Record the turn before starting it: after a crash in between, harvest finds the unit or counts a failure,
+  // and never starts a second turn alongside a running one.
   rs.n = n;
   rs.last_started_at = now;
+  rs.active = {n, unit, started_at: now, fingerprint, claim_hashes: claimHashes};
+  persist();
   try {
     systemd.start(unit, [process.execPath, ARC_BIN, 'turn', c.dir, role, String(n)], {cwd: c.paths.worktree, env});
-    rs.active = {n, unit, started_at: now, fingerprint, claim_hashes: claimHashes};
     log('turn_started', {role, turn: name, unit});
   } catch (err) {
+    rs.active = null;
     rs.consecutive_failures += 1; rs.last_finished_at = now; rs.totals.failures += 1;
     rs.last_error = `could not start turn unit: ${String(err.stderr || err.message).trim().slice(0, 500)}`;
     log('turn_failed', {role, turn: name, error: rs.last_error});
@@ -158,7 +179,7 @@ export function harvest(c, role, {turns, now, systemd, log}) {
     rs.consecutive_failures = 0; rs.last_error = null; rs.last_ok_at = now; rs.last_fingerprint = a.fingerprint;
     const report = readText(path.join(c.paths.turns, `${name}.md`), '');
     writeAtomic(path.join(c.paths.turns, `${role}-latest.md`), report);
-    if (role === 'advisor') recordAudit(c, rs, a, report, now);
+    if (role === 'advisor') { recordAudit(c, rs, a, report, now); rs.audited_hashes = Object.values(a.claim_hashes ?? {}); }
   } else {
     rs.consecutive_failures += 1; rs.totals.failures += 1; rs.last_error = exit.error;
   }
@@ -174,7 +195,7 @@ function recordAudit(c, rs, active, report, now) {
     state.audits[id] = {...v, hash: active.claim_hashes[id], turn: turnName('advisor', active.n), at: isoNow(now)};
   }
   rs.audits.total += 1;
-  if (/material issues:\s*(?!none)/i.test(report) || Object.values(verdicts).some(v => v.verdict !== 'supported')) rs.audits.flagged += 1;
+  if (/material issues:\s*(?!none\b)\S/i.test(report) || Object.values(verdicts).some(v => v.verdict !== 'supported')) rs.audits.flagged += 1;
   writeJson(file, state);
 }
 

@@ -14,7 +14,8 @@ export function realSystemd() {
       const setenv = Object.entries(env).filter(([, v]) => v !== undefined && v !== null).map(([k, v]) => `--setenv=${k}=${v}`);
       run('systemd-run', ['--user', '--collect', '--quiet', `--unit=${unit}`, `--working-directory=${cwd}`, ...setenv, ...argv]);
     },
-    isActive: unit => ['active', 'activating', 'deactivating', 'reloading'].includes(unitState(unit)),
+    // A systemctl error or timeout reads as 'unknown': treat it as still running, never as gone.
+    isActive: unit => !['inactive', 'failed'].includes(unitState(unit)),
   };
 }
 

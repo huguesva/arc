@@ -1,5 +1,6 @@
 // The only module that talks to Slurm. Tests inject a fake with the same interface.
 import {execFileSync} from 'node:child_process';
+import os from 'node:os';
 
 export const TERMINAL = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL', 'BOOT_FAIL', 'DEADLINE', 'PREEMPTED', 'REVOKED']);
 // Flags the engine owns; the site module may not set them.
@@ -33,7 +34,7 @@ export function realSlurm({timeoutMs = 120000, bin = ''} = {}) {
     },
     // Jobs of the current user still known to the controller daemon.
     queue() {
-      const out = run('squeue', ['--me', '-h', '-o', '%i|%200j|%200k|%T|%200r|%200b|%D']);
+      const out = run('squeue', ['-u', os.userInfo().username, '-h', '-o', '%i|%200j|%200k|%T|%200r|%200b|%D']);
       return out.split('\n').filter(Boolean).map(line => {
         const [id, name, comment, state, reason, gres, nodes] = line.split('|').map(s => s.trim());
         return {id, name, comment, state, held: /held/i.test(reason), gpus: gpusFromGres(gres) * (Number(nodes) || 1)};

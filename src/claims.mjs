@@ -25,8 +25,9 @@ const VERDICT = /^\s*[-*]?\s*\**(C\d+)\**\s*:\s*\**(supported|unsupported|can['�
 export function parseVerdicts(report) {
   const out = {};
   for (const line of (report ?? '').split('\n')) {
+    if (/^\W*material issues/i.test(line)) break; // bullets under "Material issues" are not verdicts
     const m = VERDICT.exec(line);
-    if (m) out[m[1]] = {verdict: m[2].toLowerCase().replace(/[’']/g, "'").replace('cannot tell', "can't tell").replace('cant tell', "can't tell"), detail: m[3].replace(/^[—–-]\s*/, '').trim()};
+    if (m && !out[m[1]]) out[m[1]] = {verdict: m[2].toLowerCase().replace(/[’']/g, "'").replace('cannot tell', "can't tell").replace('cant tell', "can't tell"), detail: m[3].replace(/^[—–-]\s*/, '').trim()};
   }
   return out;
 }

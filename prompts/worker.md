@@ -95,6 +95,11 @@ Variants tried: <how many arms, seeds or configurations were tried for this clai
   Empty the file when the blocker is resolved.
 - The advisor's audit is nonbinding. If you disagree with an issue it raises, say why in `notes.md`.
 
+## Git
+
+Commit only on your campaign branch in your worktree. Never push, merge, rebase shared branches or open pull
+requests: merging into the project is the human's decision, made outside the campaign.
+
 ## Files you must not edit
 
 `campaign.json`, `brief.md`, `steering.md`, `control/`, `state/`, `status.json`, `events.jsonl`, `turns/`, and existing

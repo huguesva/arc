@@ -113,7 +113,10 @@ test('advisor audits claims; human review binds to the claim text; an edit makes
   assert.equal(loadTurns(c).advisor.n, 1, 'nothing new to audit: advisor does not run');
 
   const log = console.log; console.log = () => {};
-  try { await main(['review', c.dir, 'C1', 'accept', '-m', 'checked seeds']); } finally { console.log = log; }
+  try {
+    await assert.rejects(main(['review', c.dir, 'C1', 'accept', '--hash', 'deadbeef', '-m', 'x']), /changed since you read it/);
+    await main(['review', c.dir, 'C1', 'accept', '--hash', states.C1.hash.slice(0, 8), '-m', 'checked seeds']);
+  } finally { console.log = log; }
   states = Object.fromEntries(claimStates(c).map(x => [x.id, x]));
   assert.equal(states.C1.state, 'reviewed:accept');
   fs.writeFileSync(c.paths.findings, FINDINGS.replace('0.03', '0.05'));
@@ -172,4 +175,38 @@ test('cli: init creates a campaign from the templates with the repo HEAD as base
   assert.equal(config.id, 'new-study');
   assert.equal(config.base_commit, commit);
   assert.ok(fs.existsSync(path.join(root, 'new-study', 'brief.md')));
+});
+
+test('verdicts: the first answer per claim wins and bullets under "Material issues" are not verdicts', () => {
+  const v = parseVerdicts('C1: supported — ok\nC2: unsupported — one seed\n\nMaterial issues:\n- C1: unsupported the number differs\n- C2: supported only by one run');
+  assert.equal(v.C1.verdict, 'supported');
+  assert.equal(v.C2.verdict, 'unsupported');
+});
+
+test('a systemctl hiccup does not end a running turn; only a definite inactive/failed does', async () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit, pauseWorker: false});
+  let state = 'unknown';
+  const systemd = {started: [], start(unit) { this.started.push(unit); }, isActive: () => !['inactive', 'failed'].includes(state)};
+  const ctx = context(c, {systemd});
+  tick(ctx);
+  assert.equal(systemd.started.length, 1);
+  assert.match(systemd.started[0], /^arc-test-campaign\.worker-0001$/);
+  ctx.now += 5 * MIN; tick(ctx);
+  assert.ok(loadTurns(c).worker.active, 'still tracked while systemctl answers unknown');
+  ctx.now += 5 * MIN; tick(ctx);
+  assert.equal(systemd.started.length, 1, 'no second turn');
+  state = 'inactive';
+  ctx.now += 1 * MIN; tick(ctx);
+  assert.equal(loadTurns(c).worker.consecutive_failures, 1, 'gone without an exit record counts as a failure');
+});
+
+test('advisor flag rate: a clean audit is not flagged', async () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit, config: {advisor: {agent: 'claude', model: 'stub-model', bin: (await import('./helpers.mjs')).STUB_AGENT}}});
+  fs.writeFileSync(c.paths.findings, FINDINGS);
+  fs.writeFileSync(path.join(c.dir, 'stub-report-advisor'), 'C1: supported — fine\nC2: supported — fine\n\nMaterial issues: none');
+  const ctx = context(c);
+  tick(ctx); ctx.now += 1000; tick(ctx);
+  assert.deepEqual(loadTurns(c).advisor.audits, {total: 1, flagged: 0});
 });

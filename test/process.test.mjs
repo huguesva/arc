@@ -16,7 +16,9 @@ test('arc run writes a heartbeat and exits cleanly on SIGTERM', async () => {
   for (const cmd of ['squeue', 'sacct']) { fs.writeFileSync(path.join(bin, cmd), '#!/bin/sh\nexit 0\n'); fs.chmodSync(path.join(bin, cmd), 0o755); }
   const cfg = tempDir('arc-config-');
   fs.writeFileSync(path.join(cfg, 'site.mjs'), 'export function route(r) { return {args: []}; }\n');
-  const child = spawn(process.execPath, [ARC, 'run', c.dir], {env: {...process.env, PATH: `${bin}:${process.env.PATH}`, ARC_CONFIG_DIR: cfg}, stdio: ['ignore', 'pipe', 'pipe']});
+  fs.mkdirSync(path.join(cfg, 'locks'));
+  const lock = path.join(cfg, 'locks', `${c.config.id}.lock`);
+  const child = spawn('flock', ['--no-fork', '--nonblock', lock, process.execPath, ARC, 'run', c.dir], {env: {...process.env, PATH: `${bin}:${process.env.PATH}`, ARC_CONFIG_DIR: cfg}, stdio: ['ignore', 'pipe', 'pipe']});
   let stderr = '';
   child.stderr.on('data', d => { stderr += d; });
   for (let i = 0; i < 100 && !fs.existsSync(c.paths.status); i++) await new Promise(r => setTimeout(r, 100));
@@ -29,4 +31,17 @@ test('arc run writes a heartbeat and exits cleanly on SIGTERM', async () => {
   const events = fs.readFileSync(c.paths.events, 'utf8');
   assert.match(events, /controller_started/);
   assert.match(events, /controller_exit/);
+});
+
+test('arc run refuses to start without holding the campaign lock', async () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit});
+  const cfg = tempDir('arc-config-');
+  fs.writeFileSync(path.join(cfg, 'site.mjs'), 'export function route(r) { return {args: []}; }\n');
+  const child = spawn(process.execPath, [ARC, 'run', c.dir], {env: {...process.env, ARC_CONFIG_DIR: cfg}, stdio: ['ignore', 'pipe', 'pipe']});
+  let stderr = '';
+  child.stderr.on('data', d => { stderr += d; });
+  const code = await new Promise(r => child.on('exit', r));
+  assert.equal(code, 1);
+  assert.match(stderr, /refusing to run without the campaign lock/);
 });

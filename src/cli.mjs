@@ -10,7 +10,7 @@ import {validateRequest, validateInRepo} from './request.mjs';
 import {commitExists, git, gitStatus} from './git.mjs';
 import {claimStates} from './claims.mjs';
 import {runController, loadRecords, isLive} from './controller.mjs';
-import {runTurn} from './turns.mjs';
+import {runTurn, unitGlob} from './turns.mjs';
 import {realSlurm} from './slurm.mjs';
 import {systemctl, unitState} from './systemd.mjs';
 
@@ -29,7 +29,7 @@ const HELP = `arc — Autonomous Research Controller
   arc priority <id> <request> <n>
   arc withdraw <id> <request> -m "reason"
   arc claims <id>
-  arc review <id> <claim> accept|reject|needs-more -m "note"
+  arc review <id> <claim> accept|reject|needs-more --hash <h> -m "note"   (h as shown by arc claims)
   arc reconcile <id> <request> --adopt <job> | --abandon
   arc restart <id>
   arc stop <id> [--cancel-jobs] -m "reason"
@@ -39,7 +39,7 @@ const HELP = `arc — Autonomous Research Controller
 
 function parse(argv) {
   const pos = [], opt = {};
-  const valued = new Set(['-m', '-f', '-t', '--campaign', '--adopt', '--repo', '--dir']);
+  const valued = new Set(['-m', '-f', '-t', '--campaign', '--adopt', '--repo', '--dir', '--hash']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (valued.has(a)) opt[a.replace(/^-+/, '')] = argv[++i];
@@ -170,7 +170,7 @@ function stop(c, opt) {
   const {paths, config} = c;
   writeAtomic(path.join(paths.control, 'STOP'), `${isoNow()} ${need(opt.m, 'reason (-m)')}\n`);
   try { systemctl('stop', unit(c)); } catch (err) { console.log(`warning: ${String(err.stderr || err.message).trim()}`); }
-  try { systemctl('stop', `arc-${config.id}-*`); } catch { /* no turn units */ }
+  try { systemctl('stop', unitGlob(config.id)); } catch { /* no turn units */ }
   const prefix = `arc:${config.id}:`;
   let queue = [];
   try { queue = realSlurm().queue().filter(r => r.comment.startsWith(prefix)); } catch (err) { console.log(`warning: cannot query scheduler: ${err.message}`); }
@@ -182,7 +182,7 @@ function stop(c, opt) {
   const lock = path.join(configDir(), 'locks', `${config.id}.lock`);
   let lockFree = true;
   try { execFileSync('flock', ['-n', lock, 'true']); } catch { lockFree = false; }
-  const turnUnits = (() => { try { return systemctl('list-units', '--plain', '--no-legend', `arc-${config.id}-*`).trim(); } catch { return ''; } })();
+  const turnUnits = (() => { try { return systemctl('list-units', '--plain', '--no-legend', unitGlob(config.id)).trim(); } catch { return ''; } })();
   console.log(`${config.id}: controller ${unitState(unit(c))}, lock ${lockFree ? 'free' : 'STILL HELD'}, turn units ${turnUnits ? 'STILL ACTIVE:\n' + turnUnits : 'none'}`);
   if (queue.length) console.log(`jobs preserved in Slurm: ${queue.map(r => `${r.id} (${r.state})`).join(', ')}`);
   return lockFree && !turnUnits && unitState(unit(c)) !== 'active' ? 0 : 1;
@@ -246,7 +246,7 @@ export async function main(argv) {
       const states = claimStates(campaign(pos[0]));
       const order = ['stale', 'audited', 'new', 'reviewed:needs-more', 'reviewed:reject', 'reviewed:accept', 'superseded'];
       states.sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
-      for (const cl of states) console.log(`${cl.id.padEnd(5)} [${cl.state}] ${cl.title}${cl.audit ? `\n      audit: ${cl.audit.verdict}${cl.audit.detail ? ` — ${cl.audit.detail}` : ''}` : ''}${cl.review ? `\n      you: ${cl.review.verdict}${cl.review.note ? ` — ${cl.review.note}` : ''}` : ''}`);
+      for (const cl of states) console.log(`${cl.id.padEnd(5)} [${cl.state}] ${cl.hash.slice(0, 8)}  ${cl.title}${cl.audit ? `\n      audit: ${cl.audit.verdict}${cl.audit.detail ? ` — ${cl.audit.detail}` : ''}` : ''}${cl.review ? `\n      you: ${cl.review.verdict}${cl.review.note ? ` — ${cl.review.note}` : ''}` : ''}`);
       if (!states.length) console.log('no claims in findings.md yet');
       return 0;
     }
@@ -257,6 +257,8 @@ export async function main(argv) {
       if (!VERDICTS.includes(verdict)) throw Error(`verdict must be one of ${VERDICTS.join(', ')}`);
       const cl = claimStates(c).find(x => x.id === id && !x.superseded);
       if (!cl) throw Error(`no current claim ${id} in findings.md`);
+      const shown = need(opt.hash, '--hash <h> (the hash shown by arc claims, so the verdict binds to the text you read)');
+      if (!cl.hash.startsWith(shown)) throw Error(`${id} changed since you read it (now ${cl.hash.slice(0, 8)}); run arc claims again`);
       appendJsonl(c.paths.reviews, {claim: id, verdict, note: opt.m ?? '', hash: cl.hash, at: isoNow(), by: os.userInfo().username});
       console.log(`${id}: ${verdict} (bound to the current text of the claim)`);
       return 0;

@@ -5,6 +5,9 @@ Description=arc campaign %i
 Type=simple
 ExecStart={{FLOCK}} --no-fork --nonblock {{CONFIG}}/locks/%i.lock {{NODE}} {{ARC}} run %i
 Restart=on-failure
+# mixed: SIGTERM reaches only the controller, which finishes its current step; leftovers are killed after it exits.
+KillMode=mixed
+TimeoutStopSec=300
 RestartSec=30
 UMask=0077
 Environment=ARC_CONFIG_DIR={{CONFIG}}

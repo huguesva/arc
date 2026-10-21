@@ -19,6 +19,10 @@ arc start "$dir"                                # checks, creates the worktree a
 arc status warmup-study
 ```
 
+Agent accounts: arc runs the `codex` or `claude` CLI and never handles keys. Choose the account with `profile`
+(Codex), `bin` (a wrapper script), `args` (e.g. `["--settings", "/path/to/settings.json"]` for Claude) or
+`env.CODEX_HOME`. Never put keys in campaign.json.
+
 `arc start` refuses to start if the base commit, an agent binary, the scheduler or the brief is missing. With
 `--no-enable` it only sets things up.
 
@@ -27,7 +31,7 @@ arc status warmup-study
 ```bash
 arc status                                   # all campaigns
 arc claims warmup-study                      # what the worker concludes, with audit verdicts
-arc review warmup-study C3 accept -m "checked 3 seeds"
+arc review warmup-study C3 accept --hash 1a2b3c4d -m "checked 3 seeds"   # hash from arc claims
 arc steer warmup-study -m "Drop the 4k arm; add a cosine-decay arm."
 arc stop warmup-study -m "done"              # jobs keep running unless --cancel-jobs
 ```

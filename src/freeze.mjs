@@ -49,7 +49,7 @@ arc_output() {
 arc_finish() {
   local status=$?
   local base
-  base="$(printf '"exit_code":%d,"job_id":"%s","started_at":"%s","finished_at":"%s"' "$status" "\${SLURM_JOB_ID:-}" "$started" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+  base="$(printf '"exit_code":%d,"job_id":"%s","host":"%s","started_at":"%s","finished_at":"%s"' "$status" "\${SLURM_JOB_ID:-}" "$(hostname)" "$started" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
   printf '{%s}\\n' "$base" > "$ARC_RUN_DIR/execution.json"
   # Result receipt: a fingerprint of each expected output as the job left it. Written second, so a kill
   # during hashing still leaves the basic record.
@@ -77,7 +77,7 @@ bash ${shellQuote(request.script)}
 }
 
 // Idempotent: a finished freeze (provenance.json for the same request hash) is reused.
-export function freeze({campaign, record, route, forbidden = []}) {
+export function freeze({campaign, record, route, forbidden = [], siteFile = null}) {
   const {config, paths} = campaign;
   const request = record.request;
   const out = path.join(paths.artifacts, request.id);
@@ -103,6 +103,7 @@ export function freeze({campaign, record, route, forbidden = []}) {
     evaluator: evaluatorStatus(config.repo, config.evaluator, request.source_commit),
     ignored_worktree_changes: ignored.split('\n').filter(Boolean),
     route: {args: route.args, note: route.note ?? null},
+    site_sha256: siteFile && fs.existsSync(siteFile) ? sha256(fs.readFileSync(siteFile)) : null,
     arc_version: ARC_VERSION,
     created_at: isoNow(),
   };

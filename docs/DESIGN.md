@@ -35,9 +35,12 @@ The worker never calls Slurm. The controller never decides what to run.
 7. **Small.** Node ≥ 20, ESM, zero npm dependencies, `node:test`. Target ≈ 1,100 lines of source.
 8. **Code protects the record and the resources; prompts guide the rest.** A rule is enforced in code only if
    breaking it would be irreversible, spend real resources, or corrupt the record: submission, budget, provenance,
-   immutable requests, human-only review. How the agents think, write and talk to each other is set by their
+   immutable requests. How the agents think, write and talk to each other is set by their
    prompts and left visible in `turns/` and `status.json`; drift is fixed by editing the prompt, not by adding
    enforcement.
+
+   Limit: the worker runs as the same Unix user, so files it must not write (`control/`, `state/`, reviews) are
+   protected by its prompt and by being visible in git and `events.jsonl`, not by permissions.
 
 ## 3. Where things live
 
@@ -94,6 +97,7 @@ The worker never calls Slurm. The controller never decides what to run.
 - `advisor`, `evaluator`, `ledger_md`, `study_spool`, `cadence`, `job_prefix` (defaults to `id`) and `job_env` are
   optional.
 - Each role may set `bin` (absolute path of the agent CLI, e.g. a wrapper script), `profile`, `effort`, `args` and `env`.
+- `job_env` values are expanded in the job under `set -u`: write `${VAR:-}` for variables that may be unset.
 - Model ids must be exact. A turn whose reported model differs from the configured one fails (no silent substitution).
 - `brief.md`: objective, baseline, evaluation protocol, budget and deadline in prose. Stable.
 - `steering.md`: append-only dated entries, `## 2026-10-21T16:09Z — title`, written by `arc steer` or by hand. Read
@@ -194,8 +198,9 @@ In order. Each step is idempotent, so a crash at any point is repaired by the ne
    --chdir=<artifact> --output=<artifact>/slurm-%j.log <site args> run.sh`. The request id is the exact token: a
    request is submitted at most once.
 4. **Record receipt**: status `submitted`, `job_id`, `released: false`.
-5. **Record the study**: write `study.json` with the job id, and copy it atomically into `study_spool` if one is set.
-   Write a ledger line (§13).
+5. **Record the study**: write `study.json` with the job id, and copy it atomically into `study_spool` if one is set
+   (the copy is checked separately, so a crash between the two writes cannot skip it). Write a ledger line (§13).
+   Adopted jobs (§9) go through this same step; one already terminal is then finished at once.
 6. **Release**: `scontrol release <job>`, then `released: true`.
 
 `study.json` uses the field names existing observers read: `id`, `title`, `hypothesis`, `source_commit`,
@@ -251,7 +256,10 @@ and, by default, the code that scores it.
 **Execution.**
 
 - The controller writes `turns/<role>-NNNN.prompt.md`, then launches
-  `systemd-run --user --collect --unit=arc-<campaign>-<role>-NNNN … arc turn <campaign> <role> NNNN`.
+  `systemd-run --user --collect --unit=arc-<campaign>.<role>-NNNN … arc turn <campaign> <role> NNNN`. Ids cannot
+  contain `.`, so `arc-<campaign>.*` matches only this campaign's turns. The turn is saved before `systemd-run`, so a
+  crash in between can never start a second turn beside a running one. Only `inactive` or `failed` from systemctl
+  counts as gone; an error or timeout counts as still running.
 - `arc turn` runs the agent CLI with the prompt on stdin and captures `.jsonl` and `.stderr`. It parses the
   transcript and writes `.md` (the report) and `.exit.json` (`{ok, model, usage, error, started_at, finished_at}`).
 - Turns are not children of the controller. Restarting or upgrading the controller never touches a turn.
@@ -280,8 +288,10 @@ and, by default, the code that scores it.
   and no turn caps.
 - After the deadline only the first condition applies.
 - **Advisor** is due when configured, no advisor turn is active, PAUSE_ADVISOR is absent, `every_min` has passed since
-  its last start, and its audit fingerprint changed. The audit fingerprint is `findings.md` plus the set of finished
-  requests. The advisor runs independently of the worker.
+  its last start, and some live claim has neither a valid audit nor a text the advisor already answered in a
+  successful turn (so a claim it cannot parse is not re-sent forever). New results reach it when the worker updates
+  the claim. Its prompt lists each cited request's record, commit and diff size; the Claude advisor may run only
+  `git show`, `git diff` and `git log`. The advisor runs independently of the worker.
 
 **Prompt**, composed fresh every turn and archived:
 
@@ -354,9 +364,11 @@ per-job review queue does not scale. One legacy notebook reached 15,000+ unticke
 - **Parsing.** Each tick the controller parses the claim blocks into `state/claims.json`, with the sha256 of each
   block's text.
 - **Audit.** The advisor's verdict lines (§12) attach to a claim together with the hash they were made against.
-- **Review.** `arc review <campaign> C3 accept|reject|needs-more -m "note"` appends `{claim, verdict, note, at, hash}`
-  to `control/reviews.jsonl`.
-  - Only a human writes that file.
+- **Review.** `arc review <campaign> C3 accept|reject|needs-more --hash <h> -m "note"` appends
+  `{claim, verdict, note, at, hash}` to `control/reviews.jsonl`.
+  - `<h>` is the hash prefix shown by `arc claims`; if the claim changed since, the review is refused, so a verdict
+    never binds to text the human did not read.
+  - Only a human writes that file (by convention and prompt; see principle 8).
   - A review counts only while the claim's hash still matches. If the worker edits the claim, it becomes `stale` and
     needs a new review.
   - The worker sees audit and review verdicts per claim in its digest.
@@ -365,7 +377,8 @@ per-job review queue does not scale. One legacy notebook reached 15,000+ unticke
   - `superseded`, for a claim moved to the superseded section.
 - **Job ledger = provenance only.** `events.jsonl` records every transition
   `{at, type, request?, job?, from?, to?, detail}`. If `ledger_md` is set, a plain line (no checkbox, no review
-  expectation) is inserted under `flock` on submission (with the job id) and on finish.
+  expectation) is appended under `flock` on submission (with the job id) and on finish. Point it at a file only arc
+  writes: a notebook rewritten by other tools under another lock can lose appended lines.
 - `status.json` (`schema: "arc.status/1"`) has every key present on every tick:
   - `controller {pid, version, started_at, heartbeat_at, phase}`, where phase is one of `running`, `paused`,
     `deadline_closed`, `stopped`, `finished`;
@@ -389,14 +402,18 @@ per-job review queue does not scale. One legacy notebook reached 15,000+ unticke
 
 - **Unit.** `arc@.service` is rendered by `arc start` with absolute node and arc paths:
   - `ExecStart=/usr/bin/flock --no-fork --nonblock %h/.config/arc/locks/%i.lock <node> <arc>/bin/arc run %i`;
-  - `Restart=on-failure`, `RestartSec=30`, `UMask=0077`, default KillMode.
+  - `Restart=on-failure`, `RestartSec=30`, `UMask=0077`, `KillMode=mixed`, `TimeoutStopSec=300`: SIGTERM reaches only
+    the controller, which finishes the step in progress (an sbatch is never killed mid-flight) and stops admitting
+    once STOP is written.
+  - `arc run` refuses to start unless it holds the campaign lock, so a manual run cannot become a second controller
+    on this node. The lock is node-local in effect: run each campaign's controller on one node only.
   - Node is the MainPID, and only short-lived children inherit the lock fd.
 - **Loop.** The tick loop is sequential (no overlap). SIGTERM finishes the current step, then exits 0.
 - **End of campaign.** After the deadline, once no job is active, no turn is active and the last worker turn started
   after the last evidence change, phase becomes `finished` and the controller exits 0.
 - **Stop.** `arc stop`:
   1. writes `control/STOP` with a reason;
-  2. stops the unit and the `arc-<id>-*` turn units;
+  2. stops the unit and the `arc-<id>.*` turn units;
   3. with `--cancel-jobs`, runs `scancel` on every campaign job;
   4. verifies that no unit is active and the lock is free, then reports what is still in Slurm.
 - **Preserved jobs.** Without `--cancel-jobs`, running and queued jobs are kept.
@@ -447,7 +464,7 @@ inventory for shared pools. The engine adds and owns `--hold`, `--parsable`, `--
 
 | Invariant | Mechanism |
 |---|---|
-| One controller per campaign | systemd instance + `flock --no-fork --nonblock` |
+| One controller per campaign | systemd instance + `flock --no-fork --nonblock`, checked by `arc run` itself |
 | Intent persisted before submit; uncertain never resubmitted | §8 step 2; §9 adopt-or-uncertain |
 | Provenance before the job can run | held submit; release only after study and ledger |
 | Immutable requests, retries get new ids | snapshot + hash on first sight; filename = id |
@@ -457,7 +474,7 @@ inventory for shared pools. The engine adds and owns `--hold`, `--parsable`, `--
 | Jobs can't submit or cancel | static scan + PATH shims |
 | Prompts re-read every turn | composed per turn from files |
 | Ledger entry per transition | `events.jsonl` (+ optional `runs.md` lines) |
-| Only a human marks a conclusion Reviewed | per-claim reviews in human-only `control/reviews.jsonl`, tied to the claim's hash |
+| Only a human marks a conclusion Reviewed | `arc review` with the hash the human saw, in `control/reviews.jsonl` (same Unix user: convention, not permission) |
 | Fair measurement is visible | pinned evaluator label (§10) |
 
 ## 18. Non-goals
@@ -550,3 +567,7 @@ Live campaigns on the legacy controllers are not touched. They finish or drain o
 | 14 | `findings.md` soft budget of 150 lines (nudge only) | recommended, accepted |
 | 15 | Human review is per claim (hash-bound, `arc review`); the job ledger is provenance only | user |
 | 16 | Enforce in code only what protects the record and the resources; agent behaviour is set by prompts (principle 8). The advisor report is passed to the worker unfiltered, as nonbinding | user |
+| 17 | `arc review` requires the claim hash shown by `arc claims` | review of arc v1 |
+| 18 | Advisor re-runs only for claim texts it has not answered; prompt carries per-request evidence; read-only git for the Claude advisor | review of arc v1 |
+| 19 | Unit uses `KillMode=mixed`; `arc run` checks it holds the lock; turn units named `arc-<id>.<role>-NNNN` | review of arc v1 |
+| 20 | Adoption always records the study and finishes terminal jobs; a queued request found in the queue is adopted, never resubmitted | review of arc v1 |

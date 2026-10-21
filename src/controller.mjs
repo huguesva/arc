@@ -6,7 +6,7 @@ import {readJson, readText, writeJson, appendJsonl, sha256, listDir, isoNow} fro
 import {REQUEST_ID_RE, validateRequest, validateInRepo} from './request.mjs';
 import {TERMINAL, ENGINE_FLAGS, realSlurm} from './slurm.mjs';
 import {freeze, studyRecord, ARC_VERSION} from './freeze.mjs';
-import {deadlineMs, loadCampaign, loadSite, resolveCampaignDir} from './campaign.mjs';
+import {deadlineMs, loadCampaign, loadSite, resolveCampaignDir, configDir} from './campaign.mjs';
 import {loadTurns, turnsFile, harvest, launch, isDue, composePrompt, workerFingerprint, claimHashes} from './turns.mjs';
 import {claimStates} from './claims.mjs';
 import {buildStatus} from './status.mjs';
@@ -33,11 +33,22 @@ function makeSave(ctx) {
   return rec => { rec.updated_at = isoNow(ctx.now); writeJson(recordFile(ctx.c, rec.id), rec); };
 }
 
+// ledger_md is a human-readable view (point it at a file only arc writes); events.jsonl is the full ledger.
 function ledgerLine(ctx, text) {
   const file = ctx.c.config.ledger_md;
-  if (!file) return;
-  try { execFileSync('flock', [`${file}.lock`, 'sh', '-c', 'cat >> "$1"', 'sh', file], {input: text + '\n', stdio: ['pipe', 'ignore', 'pipe'], timeout: 60000}); }
-  catch (err) { ctx.log('ledger_error', {error: errText(err)}); }
+  if (!file) return true;
+  try {
+    execFileSync('flock', [`${file}.lock`, 'sh', '-c', 'cat >> "$1"', 'sh', file], {input: text + '\n', stdio: ['pipe', 'ignore', 'pipe'], timeout: 60000});
+    return true;
+  } catch (err) { ctx.log('ledger_error', {error: errText(err)}); return false; }
+}
+
+function finish(ctx, rec, {state, exit = null, elapsed = null}) {
+  const from = rec.slurm_state;
+  Object.assign(rec, {status: 'finished', slurm_state: state, exit_code: exit, elapsed_s: elapsed, finished_at: isoNow(ctx.now)});
+  ctx.log('finished', {request: rec.id, job: rec.job_id, from, to: state, exit});
+  rec.ledger_finished = ledgerLine(ctx, `- ${isoNow(ctx.now)} ${ctx.c.config.id}/${rec.id}: job ${rec.job_id} ${state}, exit ${exit ?? '?'}; artifacts ${path.join(ctx.c.paths.artifacts, rec.id)}`);
+  ctx.save(rec);
 }
 
 // --- observe: follow submitted jobs to a terminal state ---
@@ -48,13 +59,9 @@ function observe(ctx, records) {
   for (const row of ctx.slurm.acct([...byJob.keys()])) {
     const rec = byJob.get(row.id);
     if (!rec || rec.slurm_state === row.state) continue;
-    const from = rec.slurm_state;
+    if (TERMINAL.has(row.state)) { finish(ctx, rec, {state: row.state, exit: row.exit, elapsed: row.elapsed}); continue; }
+    ctx.log('job_state', {request: rec.id, job: rec.job_id, from: rec.slurm_state, to: row.state});
     rec.slurm_state = row.state;
-    if (TERMINAL.has(row.state)) {
-      Object.assign(rec, {status: 'finished', exit_code: row.exit, elapsed_s: row.elapsed, finished_at: isoNow(ctx.now)});
-      ctx.log('finished', {request: rec.id, job: rec.job_id, from, to: row.state, exit: row.exit});
-      ledgerLine(ctx, `- ${isoNow(ctx.now)} ${ctx.c.config.id}/${rec.id}: job ${rec.job_id} ${row.state}, exit ${row.exit}; artifacts ${path.join(ctx.c.paths.artifacts, rec.id)}`);
-    } else ctx.log('job_state', {request: rec.id, job: rec.job_id, from, to: row.state});
     ctx.save(rec);
   }
 }
@@ -66,9 +73,17 @@ function scan(ctx, records, byId, obs) {
     if (!file.endsWith('.json') || file.includes('.tmp')) continue;
     const id = file.slice(0, -5);
     if (!REQUEST_ID_RE.test(id)) { obs.badFiles.push(file); continue; }
-    const text = readText(path.join(c.paths.requests, file), '');
     const existing = byId.get(id);
-    if (existing) { if (existing.sha256 && sha256(text) !== existing.sha256) obs.mutated.push(id); continue; }
+    const full = path.join(c.paths.requests, file);
+    if (existing) {
+      const mtime = fs.statSync(full).mtimeMs;
+      if (existing.mtime_ms === mtime && !existing.mutated) continue;
+      const mutated = !!existing.sha256 && sha256(readText(full, '')) !== existing.sha256;
+      if (mutated) obs.mutated.push(id);
+      if (existing.mtime_ms !== mtime || existing.mutated !== mutated) { Object.assign(existing, {mtime_ms: mtime, mutated}); ctx.save(existing); }
+      continue;
+    }
+    const text = readText(full, '');
     let request = null, errors;
     try { request = JSON.parse(text); errors = validateRequest(request, {fileId: id}); }
     catch (err) {
@@ -81,8 +96,9 @@ function scan(ctx, records, byId, obs) {
       try { errors = validateInRepo(request, c.config.repo, ctx.site.forbidden(request) ?? []); }
       catch (err) { ctx.log('scan_retry', {request: id, error: errText(err)}); continue; } // git timeout: try next tick
       if (!errors.length) { try { ctx.site.validate(request); } catch (err) { errors = [`cluster rules: ${err.message}`]; } }
+      if (!errors.length && request.gpus > c.config.gpu_cap) errors = [`${request.gpus} GPUs can never fit the campaign budget of ${c.config.gpu_cap}`];
     }
-    const rec = {id, status: errors.length ? 'rejected' : 'queued', request, sha256: sha256(text), first_seen: isoNow(ctx.now), attempts: 0, reason: errors.join('; ') || null};
+    const rec = {id, status: errors.length ? 'rejected' : 'queued', request, sha256: sha256(text), mtime_ms: fs.statSync(full).mtimeMs, first_seen: isoNow(ctx.now), attempts: 0, reason: errors.join('; ') || null};
     ctx.save(rec); records.push(rec); byId.set(id, rec);
     ctx.log(errors.length ? 'rejected' : 'queued', {request: id, ...(errors.length ? {reason: rec.reason} : {})});
   }
@@ -119,19 +135,26 @@ function applyReconcile(ctx, byId) {
   }
 }
 
+// Every adoption goes through the same path as a normal receipt: study, ledger, and finish if already terminal.
 function adopt(ctx, rec, {id, state, released}) {
   Object.assign(rec, {status: 'submitted', job_id: id, released, slurm_state: state ?? 'PENDING', submitted_at: rec.submitted_at ?? isoNow(ctx.now), last_error: null});
   ctx.save(rec);
-  ctx.log('adopted', {request: rec.id, job: id});
+  ctx.log('adopted', {request: rec.id, job: id, state: rec.slurm_state});
+  recordStudy(ctx, rec);
+  if (TERMINAL.has(rec.slurm_state)) finish(ctx, rec, {state: rec.slurm_state});
 }
 
-// --- reconcile: adopt exact matches for uncertain intents, count orphans ---
+// --- reconcile: adopt exact matches for unresolved intents, re-check holds, count orphans ---
 function reconcile(ctx, records, obs) {
   const {c} = ctx;
   const prefix = `arc:${c.config.id}:`;
   const ours = ctx.slurm.queue().filter(r => r.comment.startsWith(prefix));
-  for (const rec of records.filter(r => r.status === 'submitting' || r.status === 'uncertain')) {
-    const matches = ours.filter(r => r.comment === token(c, rec.id));
+  const byToken = new Map();
+  for (const row of ours) byToken.set(row.comment, [...(byToken.get(row.comment) ?? []), row]);
+  for (const rec of records.filter(r => r.status === 'submitting' || r.status === 'uncertain' || r.status === 'queued')) {
+    const matches = byToken.get(token(c, rec.id)) ?? [];
+    // A queued request already in the queue means an sbatch error was misclassified: adopt, never duplicate.
+    if (rec.status === 'queued') { if (matches.length === 1) adopt(ctx, rec, {id: matches[0].id, state: matches[0].state, released: !matches[0].held}); continue; }
     if (matches.length === 1) { adopt(ctx, rec, {id: matches[0].id, state: matches[0].state, released: !matches[0].held}); continue; }
     let past = [];
     if (!matches.length) {
@@ -146,32 +169,44 @@ function reconcile(ctx, records, obs) {
       ctx.save(rec); ctx.log('uncertain', {request: rec.id, matches: n});
     }
   }
-  const known = new Set(records.map(r => r.job_id).filter(Boolean));
-  for (const row of ours) if (!known.has(row.id)) obs.orphans.push({id: row.id, name: row.name, gpus: row.gpus});
+  const byJob = new Map(records.filter(r => r.job_id).map(r => [r.job_id, r]));
+  for (const row of ours) {
+    const rec = byJob.get(row.id);
+    if (!rec) { obs.orphans.push({id: row.id, name: row.name, gpus: row.gpus}); continue; }
+    if (row.held && rec.released && rec.status === 'submitted') { rec.released = false; ctx.save(rec); ctx.log('still_held', {request: rec.id, job: rec.job_id}); }
+  }
 }
 
-// --- release: write the study record and ledger line, then let the job run ---
-function releaseRecord(ctx, rec) {
+// --- study record: provenance an observer can ingest, written before the job may run ---
+function recordStudy(ctx, rec) {
   const {c} = ctx;
   const out = path.join(c.paths.artifacts, rec.id);
   const studyFile = path.join(out, 'study.json');
-  if (!fs.existsSync(studyFile)) {
-    const study = studyRecord({campaign: c, record: rec, provenance: readJson(path.join(out, 'provenance.json')), out});
-    writeJson(studyFile, study);
-    if (c.config.study_spool) writeJson(path.join(c.config.study_spool, `${study.id}.json`), study);
+  let study = readJson(studyFile);
+  if (!study) { study = studyRecord({campaign: c, record: rec, provenance: readJson(path.join(out, 'provenance.json')), out}); writeJson(studyFile, study); }
+  if (c.config.study_spool) {
+    const spooled = path.join(c.config.study_spool, `${study.id}.json`);
+    if (!fs.existsSync(spooled)) writeJson(spooled, study);
   }
   if (!rec.ledger_submitted) {
     const r = rec.request;
-    ledgerLine(ctx, `- ${isoNow(ctx.now)} ${c.config.id}/${rec.id}: job ${rec.job_id} submitted (${r.gpus} GPUs, ${r.kind}, seed ${r.seed}, evaluator ${rec.evaluator_status ?? 'not pinned'}). ${r.hypothesis} Source ${r.source_commit}; artifacts ${out}`);
-    rec.ledger_submitted = true;
+    rec.ledger_submitted = ledgerLine(ctx, `- ${isoNow(ctx.now)} ${c.config.id}/${rec.id}: job ${rec.job_id} submitted (${r.gpus} GPUs, ${r.kind}, seed ${r.seed}, evaluator ${rec.evaluator_status ?? 'not pinned'}). ${r.hypothesis} Source ${r.source_commit}; artifacts ${out}`);
   }
+  rec.study_recorded = true;
+  ctx.save(rec);
+}
+
+// --- release: only after the study is recorded ---
+function releaseRecord(ctx, rec) {
+  if (!rec.study_recorded || !rec.ledger_submitted) recordStudy(ctx, rec);
+  if (rec.released) return;
   try {
     ctx.slurm.release(rec.job_id);
     rec.released = true;
     ctx.log('released', {request: rec.id, job: rec.job_id});
   } catch (err) {
     const msg = errText(err);
-    if (/not held|already|invalid job id|not pending|has finished|completed/i.test(msg)) rec.released = true;
+    if (/not held|invalid job id|already complet|already finished|has finished/i.test(msg)) rec.released = true;
     else { rec.last_error = `release: ${msg}`; ctx.log('release_retry', {request: rec.id, job: rec.job_id, error: msg}); }
   }
   ctx.save(rec);
@@ -189,7 +224,7 @@ function retryLater(ctx, rec, message) {
 function submit(ctx, rec, route) {
   const {c} = ctx;
   let frozen;
-  try { frozen = freeze({campaign: c, record: rec, route, forbidden: ctx.site.forbidden(rec.request) ?? []}); }
+  try { frozen = freeze({campaign: c, record: rec, route, forbidden: ctx.site.forbidden(rec.request) ?? [], siteFile: ctx.site.file}); }
   catch (err) { retryLater(ctx, rec, `freeze: ${errText(err)}`); return 'retry'; }
   const {out, provenance} = frozen;
   Object.assign(rec, {status: 'submitting', intent_at: isoNow(ctx.now), route, evaluator_status: provenance.evaluator?.status ?? null});
@@ -197,6 +232,8 @@ function submit(ctx, rec, route) {
   ctx.log('submitting', {request: rec.id});
   const args = ['--parsable', '--hold', '--no-requeue', `--job-name=${jobName(c, rec.id)}`, `--comment=${token(c, rec.id)}`,
     `--chdir=${out}`, `--output=${path.join(out, 'slurm-%j.log')}`, ...route.args];
+  rec.sbatch_args = args;
+  ctx.save(rec);
   const res = ctx.slurm.submit(args, path.join(out, 'run.sh'));
   if (res.ok) {
     Object.assign(rec, {status: 'submitted', job_id: res.id, released: false, slurm_state: 'PENDING', submitted_at: isoNow(ctx.now), last_error: null});
@@ -254,6 +291,7 @@ function admit(ctx, records, byId, obs, flags) {
       if (route?.wait) { wait = `route: ${route.wait}`; blockedAt = Math.max(blockedAt, p); }
       else if (route && engineFlagIn(route.args)) { retryLater(ctx, rec, `route: site returned engine-owned flag ${engineFlagIn(route.args)}`); wait = 'retry'; }
     }
+    if (!wait && fs.existsSync(path.join(c.paths.control, 'STOP'))) break; // stopping: no new submissions
     if (!wait) {
       const result = submit(ctx, rec, route);
       if (result === 'submitted' || result === 'uncertain') { obs.reserved += r.gpus; continue; }
@@ -286,12 +324,18 @@ export function tick(ctx) {
     writeStatus('stopped', claimStates(c));
     return {stop: true};
   }
-  observe(ctx, records);
-  scan(ctx, records, byId, obs);
-  applyReconcile(ctx, byId);
-  reconcile(ctx, records, obs);
-  for (const rec of records) if (rec.status === 'submitted' && !rec.released && !TERMINAL.has(rec.slurm_state)) releaseRecord(ctx, rec);
-  admit(ctx, records, byId, obs, flags);
+  // Each phase fails on its own, so a scheduler hiccup never stops turns or status.
+  const errors = [];
+  const step = (name, fn) => { try { fn(); return true; } catch (err) { errors.push(`${name}: ${errText(err)}`); ctx.log('phase_error', {phase: name, error: String(err.stack ?? err).slice(0, 4000)}); return false; } };
+  step('observe', () => observe(ctx, records));
+  step('scan', () => scan(ctx, records, byId, obs));
+  step('reconcile-commands', () => applyReconcile(ctx, byId));
+  const reconciled = step('reconcile', () => reconcile(ctx, records, obs));
+  step('release', () => { for (const rec of records) if (rec.status === 'submitted' && !TERMINAL.has(rec.slurm_state) && (!rec.released || !rec.study_recorded || !rec.ledger_submitted)) releaseRecord(ctx, rec); });
+  // Without a fresh view of the queue, orphans and adoptions are unknown: admitting would be unsafe.
+  if (reconciled) step('admit', () => admit(ctx, records, byId, obs, flags));
+  else obs.reserved = records.filter(isLive).reduce((n, r) => n + (r.request?.gpus ?? 0), 0);
+  if (errors.length) obs.tickError = errors.join('; ');
 
   // Turns: harvest finished ones, then launch any that are due.
   for (const role of ['worker', 'advisor']) harvest(c, role, {turns, now, systemd: ctx.systemd, log: ctx.log});
@@ -306,13 +350,16 @@ export function tick(ctx) {
   const w = isDue({rs: turns.worker, now, every: {changed: cad.changed_min, idle: cad.idle_min, busy: cad.busy_min},
     changed: fp !== turns.worker.last_fingerprint, activeJobs, closed, paused: flags.pauseWorker});
   turns.worker.next_due_at = w.next_due_at;
-  if (w.due) launch(c, 'worker', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: fp, log: ctx.log,
+  const persist = () => writeJson(turnsFile(c), turns);
+  if (w.due) launch(c, 'worker', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: fp, log: ctx.log, persist,
     prompt: composePrompt(c, 'worker', {site: ctx.site, status, records, claims, rs: turns.worker})});
   if (c.config.advisor) {
-    const unaudited = claims.some(cl => !cl.superseded && !cl.audit && !cl.duplicate);
+    // Claim texts the advisor already answered (successfully) are not re-sent, even if no verdict parsed.
+    const answered = new Set(turns.advisor.audited_hashes ?? []);
+    const unaudited = claims.some(cl => !cl.superseded && !cl.audit && !cl.duplicate && !answered.has(cl.hash));
     const a = isDue({rs: turns.advisor, now, every: {changed: c.config.advisor.every_min ?? 60}, changed: unaudited, activeJobs, closed: true, paused: flags.pauseAdvisor});
     turns.advisor.next_due_at = a.next_due_at;
-    if (a.due) launch(c, 'advisor', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: null, log: ctx.log,
+    if (a.due) launch(c, 'advisor', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: null, log: ctx.log, persist,
       claimHashes: claimHashes(readText(c.paths.findings, '')),
       prompt: composePrompt(c, 'advisor', {site: ctx.site, status, records, claims, rs: turns.advisor})});
   }
@@ -336,8 +383,19 @@ const sleep = (ms, signal) => new Promise(resolve => {
 });
 
 // systemd entry point: `arc run <id>`.
+// True when this process holds the campaign lock (inherited from `flock --no-fork` in the unit).
+function holdsLock(lock) {
+  if (!fs.existsSync(lock)) return false;
+  const real = fs.realpathSync(lock);
+  const mine = fs.readdirSync('/proc/self/fd').some(fd => { try { return fs.readlinkSync(`/proc/self/fd/${fd}`) === real; } catch { return false; } });
+  if (!mine) return false;
+  try { execFileSync('flock', ['-n', lock, 'true'], {stdio: 'ignore'}); return false; } catch { return true; }
+}
+
 export async function runController(ref, {tickMs = 30000} = {}) {
   const c = loadCampaign(resolveCampaignDir(ref));
+  const lock = path.join(configDir(), 'locks', `${c.config.id}.lock`);
+  if (!holdsLock(lock)) throw Error(`refusing to run without the campaign lock ${lock}; start it with arc start (systemd) so only one controller runs`);
   const site = await loadSite();
   const log = (type, data = {}) => appendJsonl(c.paths.events, {at: isoNow(), type, ...data});
   const ctx = newContext({c, site, slurm: realSlurm(), systemd: realSystemd(), log});

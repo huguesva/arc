@@ -26,7 +26,7 @@ goal and the verdict. You read evidence and act through `arc` commands only.
 |---|---|
 | Start a campaign | `arc start <dir>`, once `~/.config/arc/site.mjs` exists (the user's cluster config; it lives only there) |
 | Change direction | `arc steer <id> -m "..."` (both roles read it next turn) |
-| Accept, reject or ask more of a claim | `arc review <id> C3 accept\|reject\|needs-more -m "note"` (only when the human decides) |
+| Accept, reject or ask more of a claim | `arc review <id> C3 accept\|reject\|needs-more --hash <h> -m "note"` (h from `arc claims`; only when the human decides) |
 | Run something first | `arc priority <id> <request> <n>` |
 | Drop a queued request | `arc withdraw <id> <request> -m "reason"` |
 | Hold new submissions or turns | `arc pause <id> [submissions\|worker\|advisor]`, `arc resume ...` |
