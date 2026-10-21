@@ -33,6 +33,11 @@ The worker never calls Slurm. The controller never decides what to run.
    `site.mjs` that is never committed. No constant appears in two places.
 6. **Everything done by hand before is a CLI verb.** No reload scripts, no state surgery.
 7. **Small.** Node ≥ 20, ESM, zero npm dependencies, `node:test`. Target ≈ 1,100 lines of source.
+8. **Code protects the record and the resources; prompts guide the rest.** A rule is enforced in code only if
+   breaking it would be irreversible, spend real resources, or corrupt the record: submission, budget, provenance,
+   immutable requests, human-only review. How the agents think, write and talk to each other is set by their
+   prompts and left visible in `turns/` and `status.json`; drift is fixed by editing the prompt, not by adding
+   enforcement.
 
 ## 3. Where things live
 
@@ -325,7 +330,9 @@ The advisor checks claims; it doesn't plan research.
   - then `Material issues: none` or a list where every item cites a file, job id or number.
   - Only issues that would change a conclusion or the next decision count. No suggested experiments, no style notes.
 - **Framing in the prompt**: "Most audits find no material issues; saying so is a correct and complete result."
-- Only the verdict block reaches the worker. The worker may disagree, giving the reason in `notes.md`.
+- The worker sees the per-claim verdicts in its digest and the advisor's latest report, labelled nonbinding
+  (principle 8: the report shape is a prompt rule, not filtered in code). The worker may disagree, giving the
+  reason in `notes.md`.
 - `status.json` shows the advisor's flag rate. A rate near 100% is a prompt problem to fix.
 
 ## 13. Claims, review, ledger, status
@@ -542,3 +549,4 @@ Live campaigns on the legacy controllers are not touched. They finish or drain o
 | 13 | No project layer; `ext` is free-form | recommended, accepted |
 | 14 | `findings.md` soft budget of 150 lines (nudge only) | recommended, accepted |
 | 15 | Human review is per claim (hash-bound, `arc review`); the job ledger is provenance only | user |
+| 16 | Enforce in code only what protects the record and the resources; agent behaviour is set by prompts (principle 8). The advisor report is passed to the worker unfiltered, as nonbinding | user |
