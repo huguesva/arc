@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {execFileSync, spawnSync} from 'node:child_process';
 import {tick} from '../src/controller.mjs';
-import {fakeSlurm, tempRepo, makeCampaign, request, writeRequest, context, record, status, commitFiles} from './helpers.mjs';
+import {fakeSlurm, tempRepo, makeCampaign, request, writeRequest, context, record, status, commitFiles, testSite} from './helpers.mjs';
 
 const MIN = 60000;
 const setup = (config = {}) => { const {repo, commit} = tempRepo(); const c = makeCampaign({repo, commit, config}); return {repo, commit, c}; };
@@ -388,4 +388,39 @@ test('a job still held after a release is released again', () => {
   ctx.slurm.jobs.get(id).held = true; // e.g. a release that silently did not take
   tick(ctx);
   assert.equal(ctx.slurm.jobs.get(id).held, false);
+});
+
+test('site.notify is opt-in and called once per new alert, again only after it clears and returns', () => {
+  const {c} = setup();
+  const calls = [];
+  const site = {...testSite, notify: a => calls.push(a)};
+  const ctx = context(c, {site});
+  tick(ctx);
+  assert.equal(calls.length, 0, 'no alerts, nothing sent');
+  fs.writeFileSync(c.paths.blocked, 'The gate cannot be computed.\n');
+  ctx.now += MIN; tick(ctx);
+  ctx.now += MIN; tick(ctx);
+  assert.deepEqual(calls.map(a => [a.campaign, a.code]), [['test-campaign', 'blocked']], 'sent once, not every tick');
+  assert.match(calls[0].message, /gate cannot be computed/);
+  fs.writeFileSync(c.paths.blocked, '');
+  ctx.now += MIN; tick(ctx);
+  fs.writeFileSync(c.paths.blocked, 'Still stuck.\n');
+  ctx.now += MIN; tick(ctx);
+  assert.equal(calls.length, 2, 'a cleared alert that returns is sent again');
+
+  const failing = {...testSite, notify: () => { throw Error('notifier down'); }};
+  const ctx2 = context(c, {site: failing});
+  fs.writeFileSync(c.paths.findings, Array(200).fill('line').join('\n'));
+  ctx2.now += MIN; tick(ctx2);
+  assert.ok(ctx2.events.some(e => e.type === 'notify_error' && e.code === 'findings_long' && /notifier down/.test(e.error)), 'errors are logged');
+  assert.ok(fs.existsSync(c.paths.status), 'and never stop the tick');
+});
+
+test('without site.notify nothing is sent and no notification state is kept', () => {
+  const {c} = setup();
+  fs.writeFileSync(c.paths.blocked, 'stuck\n');
+  const ctx = context(c);
+  tick(ctx);
+  assert.ok(status(c).alerts.some(a => a.code === 'blocked'));
+  assert.ok(!fs.existsSync(path.join(c.paths.state, 'notified.json')));
 });

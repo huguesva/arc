@@ -17,7 +17,7 @@ const MIN = 60000;
 const FINDINGS_SOFT_LINES = 150;
 
 const emptyRole = () => ({n: 0, active: null, last_started_at: 0, last_finished_at: 0, last_ok_at: 0, consecutive_failures: 0,
-  last_error: null, last_fingerprint: null, totals: {turns: 0, failures: 0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, cost_usd: 0}, audits: {total: 0, flagged: 0}});
+  last_error: null, last_fingerprint: null, idle_streak: 0, totals: {turns: 0, failures: 0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, cost_usd: 0}, audits: {total: 0, flagged: 0}});
 
 export const turnsFile = c => path.join(c.paths.state, 'turns.json');
 export function loadTurns(c) {
@@ -43,8 +43,10 @@ export function workerFingerprint(c, records) {
 }
 
 const backoffMs = failures => Math.min(60, 2 ** failures) * MIN;
+// Idle wake-ups (no job active, nothing new) double after each one, up to every.idleMax. News resets the streak.
+const idleMin = (every, streak = 0) => Math.min(every.idleMax ?? Infinity, every.idle * 2 ** Math.min(streak, 20));
 
-// Returns {due, next_due_at}. No caps, no timeouts: only cadence and failure backoff.
+// Returns {due, next_due_at}. No caps, no timeouts: only cadence and backoff.
 export function isDue({rs, now, every, changed, activeJobs, closed, paused}) {
   if (paused || rs.active) return {due: false, next_due_at: null};
   if (rs.consecutive_failures) {
@@ -54,7 +56,7 @@ export function isDue({rs, now, every, changed, activeJobs, closed, paused}) {
   const since = now - rs.last_started_at;
   const candidates = [];
   if (changed) candidates.push(rs.last_started_at + every.changed * MIN);
-  if (!closed) candidates.push(rs.last_started_at + (activeJobs ? every.busy : every.idle) * MIN);
+  if (!closed) candidates.push(rs.last_started_at + (activeJobs ? every.busy : idleMin(every, rs.idle_streak)) * MIN);
   if (!candidates.length) return {due: false, next_due_at: null};
   const at = Math.min(...candidates);
   return {due: now >= at && since >= 0, next_due_at: at};

@@ -62,6 +62,7 @@ The worker never calls Slurm. The controller never decides what to run.
   state/requests/<request>.json         controller: one record per request
   state/turns.json                      controller: turn bookkeeping
   state/claims.json                     controller: parsed claims, audit verdicts, review validity
+  state/notified.json                   controller: alerts already passed to site.notify (only if it exists)
   artifacts/<request>/                  controller, then the job:
       request.json provenance.json study.json source.tar run.sh
       source/ (extracted by the job) slurm-<job>.log execution.json <expected outputs>
@@ -87,7 +88,7 @@ The worker never calls Slurm. The controller never decides what to run.
   "evaluator": { "commit": "<40 hex>", "paths": ["eval/", "data/splits/test.txt"] },
   "worker":  { "agent": "codex", "model": "<model id>", "profile": "<optional>", "effort": "high", "args": [] },
   "advisor": { "agent": "claude", "model": "<model id>", "every_min": 60 },
-  "cadence": { "changed_min": 2, "idle_min": 20, "busy_min": 60 },
+  "cadence": { "changed_min": 2, "idle_min": 20, "idle_max_min": 240, "busy_min": 60 },
   "ledger_md": "/path/to/notebook/runs.md",
   "study_spool": "/path/to/observer/spool"
 }
@@ -285,10 +286,14 @@ and, by default, the code that scores it.
   check-ins.
 - **Worker** is due when no worker turn is active, PAUSE_WORKER is absent, and at least one holds:
   - the fingerprint changed since the last turn started, and `changed_min` has passed;
-  - no job is active and `idle_min` has passed;
+  - no job is active and the idle interval has passed;
   - `busy_min` has passed.
 - Failure backoff: `min(60, 2^consecutive_failures)` minutes after the failed turn. Never permanent. No turn timeouts
   and no turn caps.
+- **Idle backoff.** The idle interval is `idle_min`, doubled after each turn that only the idle timer woke (no job
+  active, fingerprint unchanged, no failure to retry), up to `idle_max_min` (default 240). Any other turn resets it.
+  A worker waiting on the human otherwise costs a full turn every `idle_min` for as long as nobody looks; steering is
+  news, so it still gets an answer within `changed_min`. `status.json` shows the streak.
 - After the deadline only the first condition applies.
 - **Check-in turns.** When the worker is due only because `busy_min` passed (jobs running, fingerprint unchanged, no
   failure to retry), it gets a short check-in prompt (`prompts/worker-checkin.md`): the running jobs with their log
@@ -329,6 +334,10 @@ and, by default, the code that scores it.
 - `notes.md`: an append-only lab notebook.
 - `blocked.md`: written when a task looks impossible, contradictory or mis-specified. It is shown at the top of
   status and to the advisor, and does not stop anything.
+- When a procedure, gate or success criterion in the brief can't be carried out or can't discriminate, the worker
+  protocol says not to wait: write `blocked.md`, adopt the most defensible feasible substitute, label what depends on
+  it exploratory, and carry on. The pinned evaluator code, claim reviews and the controller's files are excluded. This
+  is a prompt rule (principle 8); the brief template asks for priorities and predictions rather than go/no-go gates.
 
 ## 12. Advisor protocol (auditor)
 
@@ -395,8 +404,8 @@ per-job review queue does not scale. One legacy notebook reached 15,000+ unticke
   - `budget {cap, reserved, free, orphan_gpus}`;
   - `counts` by status, and `queue [{id, priority, waiting_for}]`;
   - `jobs {active, recent}`;
-  - `roles.{worker,advisor} {active, last_started, last_finished, next_due_at, consecutive_failures, last_error,
-    health}`;
+  - `roles.{worker,advisor} {active, last_started, last_finished, next_due_at, idle_streak, consecutive_failures,
+    last_error, health}`;
   - `blocked`;
   - `claims {total, awaiting_review, stale, audited_unsupported, accepted, rejected}`;
   - `alerts [{code, message, ids}]`.
@@ -405,6 +414,9 @@ per-job review queue does not scale. One legacy notebook reached 15,000+ unticke
   - `role_failing` (3 or more consecutive failures, with the provider's message), `controller_error` (last tick
     threw);
   - `evaluator_modified`, `findings_long`, `blocked`.
+- Notifications are opt-in. If `site.notify` exists, the controller calls it once when an alert first appears (keyed by
+  code and ids, kept in `state/notified.json`), and again only after the alert clears and returns. Errors are logged as
+  `notify_error` and never stop a tick. Without the hook nothing is sent.
 - `arc status` reports the controller as dead if the heartbeat is older than 3 minutes or the unit is inactive.
 
 ## 14. Process model
@@ -463,6 +475,7 @@ export const prompt                             cluster-rules text for both role
 export function validate(request)               throw for shapes the cluster can't run (permanent)
 export function route(request, {squeue, campaign}) -> {args: [...], note} | {wait: reason}
 export function forbidden(request) -> [names]   extra commands to block in jobs
+export function notify(alert, {campaign, exec}) optional: called once per new alert (§13); omit it for no notifications
 ```
 
 `route` returns partition, account, QoS, nodes, tasks, CPUs, memory, time and GRES arguments. It may query live
@@ -489,7 +502,7 @@ inventory for shared pools. The engine adds and owns `--hold`, `--parsable`, `--
 ## 18. Non-goals
 
 Never added: pilot gates; caps on turns, calls, jobs or job duration; model-turn timeouts; advisor approval steps;
-chat notifications (files are the channel); stopping rules the human didn't ask for; permanent failure after N
+built-in notifications (files are the channel; a site may opt in with `notify`, §16); stopping rules the human didn't ask for; permanent failure after N
 retries.
 
 Not in v1: a separate project layer; validation of `ext`; a cross-campaign submit lock (the site's live inventory
@@ -582,3 +595,6 @@ Live campaigns on the legacy controllers are not touched. They finish or drain o
 | 20 | Adoption always records the study and finishes terminal jobs; a queued request found in the queue is adopted, never resubmitted | review of arc v1 |
 | 21 | Only accepted, rejected, dropped and finished requests wake the worker; a job starting to run does not | user |
 | 22 | Busy-timer wake-ups with no news are short check-in turns, optionally with cheaper settings (worker.checkin) | user |
+| 23 | An infeasible procedure, gate or criterion in the brief never idles the campaign: the worker substitutes, labels it exploratory and carries on (prompt rule); briefs state priorities, not gates | review of the order-free-causal campaign, accepted by user |
+| 24 | Idle-timer wake-ups with no news back off: `idle_min` doubling to `idle_max_min` (default 240); any other turn resets | review of the order-free-causal campaign, accepted by user |
+| 25 | Notifications only through an optional `site.notify` hook, once per new alert; the engine sends nothing by default | user |

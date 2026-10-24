@@ -347,14 +347,19 @@ export function tick(ctx) {
   let phase = phaseOf(c, flags, now);
   const status = buildStatus({c, records, obs, turns, claims, now, phase, controller: ctx.controller});
   const cad = c.config.cadence;
-  const w = isDue({rs: turns.worker, now, every: {changed: cad.changed_min, idle: cad.idle_min, busy: cad.busy_min},
+  const w = isDue({rs: turns.worker, now, every: {changed: cad.changed_min, idle: cad.idle_min, idleMax: cad.idle_max_min, busy: cad.busy_min},
     changed: fp !== turns.worker.last_fingerprint, activeJobs, closed, paused: flags.pauseWorker});
   turns.worker.next_due_at = w.next_due_at;
   const persist = () => writeJson(turnsFile(c), turns);
+  const quiet = fp === turns.worker.last_fingerprint && !turns.worker.consecutive_failures;
   // Woken only by the busy timer (jobs running, nothing new, no failure to retry): a short check-in turn.
-  const checkin = fp === turns.worker.last_fingerprint && status.jobs.active.length > 0 && !turns.worker.consecutive_failures;
-  if (w.due) launch(c, 'worker', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: fp, log: ctx.log, persist, kind: checkin ? 'checkin' : 'full',
-    prompt: checkin ? composeCheckinPrompt(c, {status}) : composePrompt(c, 'worker', {site: ctx.site, status, records, claims, rs: turns.worker})});
+  const checkin = quiet && status.jobs.active.length > 0;
+  if (w.due) {
+    // Woken only by the idle timer (nothing running, nothing new): the next idle wake-up comes later.
+    turns.worker.idle_streak = quiet && !activeJobs ? (turns.worker.idle_streak ?? 0) + 1 : 0;
+    launch(c, 'worker', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: fp, log: ctx.log, persist, kind: checkin ? 'checkin' : 'full',
+      prompt: checkin ? composeCheckinPrompt(c, {status}) : composePrompt(c, 'worker', {site: ctx.site, status, records, claims, rs: turns.worker})});
+  }
   if (c.config.advisor) {
     // Claim texts the advisor already answered (successfully) are not re-sent, even if no verdict parsed.
     const answered = new Set(turns.advisor.audited_hashes ?? []);
@@ -369,9 +374,28 @@ export function tick(ctx) {
 
   const finished = closed && !activeJobs && !turns.worker.active && !turns.advisor.active && fp === turns.worker.last_fingerprint;
   if (finished) phase = 'finished';
-  writeStatus(phase, claims);
+  const final = buildStatus({c, records, obs, turns, claims, now, phase, controller: ctx.controller});
+  writeJson(c.paths.status, final);
+  notifyNewAlerts(ctx, final.alerts);
   if (finished) ctx.log('finished_campaign', {});
   return {finished};
+}
+
+// Opt-in: site.notify(alert, ctx) is called once when an alert first appears, and again only after it clears and
+// returns. Without a notify hook nothing is sent; files stay the channel.
+function notifyNewAlerts(ctx, alerts) {
+  const {c, site} = ctx;
+  if (typeof site.notify !== 'function') return;
+  const file = path.join(c.paths.state, 'notified.json');
+  const key = a => `${a.code}:${a.ids.join(',')}`;
+  const before = new Set(readJson(file, {keys: []})?.keys ?? []);
+  const keys = alerts.map(key);
+  for (const a of alerts) {
+    if (before.has(key(a))) continue;
+    try { site.notify({campaign: c.config.id, ...a}, {campaign: c.config, exec: ctx.slurm.exec}); ctx.log('notified', {code: a.code, ids: a.ids}); }
+    catch (err) { ctx.log('notify_error', {code: a.code, error: errText(err)}); }
+  }
+  if (keys.length !== before.size || keys.some(k => !before.has(k))) writeJson(file, {keys});
 }
 
 export function newContext({c, site, slurm, systemd, log}) {

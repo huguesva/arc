@@ -29,6 +29,41 @@ test('cadence: news after 2 min, idle 20 min, busy 60 min, backoff on failure, d
   assert.equal(due({now: 999 * MIN, rs: {active: {n: 1}}}), false, 'one turn at a time');
 });
 
+test('cadence: idle wake-ups double with the idle streak, up to idleMax', () => {
+  const due = (streak, now) => isDue({rs: {active: null, last_started_at: 0, last_finished_at: 0, consecutive_failures: 0, idle_streak: streak},
+    now, every: {...every, idleMax: 240}, changed: false, activeJobs: false, closed: false, paused: false});
+  assert.equal(due(0, 20 * MIN).due, true);
+  assert.equal(due(2, 79 * MIN).due, false);
+  assert.equal(due(2, 80 * MIN).due, true);
+  assert.equal(due(9, 239 * MIN).due, false, 'capped at idleMax');
+  assert.equal(due(9, 240 * MIN).due, true);
+  assert.equal(isDue({rs: {active: null, last_started_at: 0, consecutive_failures: 0, idle_streak: 9}, now: 2 * MIN, every: {...every, idleMax: 240},
+    changed: true, activeJobs: false, closed: false, paused: false}).due, true, 'news is not delayed by the idle streak');
+});
+
+test('idle turns with no news back off, and news resets the streak', () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit, pauseWorker: false});
+  const ctx = context(c);
+  const t0 = ctx.now;
+  const turn = at => { ctx.now = at; tick(ctx); ctx.now += 1000; tick(ctx); };
+  turn(t0); // first turn: the fingerprint is new
+  assert.equal(loadTurns(c).worker.idle_streak, 0);
+  turn(t0 + 20 * MIN);
+  assert.equal(ctx.systemd.started.length, 2, 'first idle wake-up after idle_min');
+  assert.equal(loadTurns(c).worker.idle_streak, 1);
+  turn(t0 + 59 * MIN);
+  assert.equal(ctx.systemd.started.length, 2, 'the next idle wake-up waits twice as long');
+  turn(t0 + 60 * MIN);
+  assert.equal(ctx.systemd.started.length, 3);
+  assert.equal(status(c).roles.worker.idle_streak, 2);
+  assert.equal(status(c).roles.worker.next_due_at, new Date(t0 + 140 * MIN).toISOString());
+  fs.appendFileSync(c.paths.steering, '\n## 2026-10-22T01:05Z — go\n\nStart arm D.\n');
+  turn(t0 + 62 * MIN);
+  assert.equal(ctx.systemd.started.length, 4, 'steering still wakes the worker after changed_min');
+  assert.equal(loadTurns(c).worker.idle_streak, 0, 'news resets the streak');
+});
+
 test('worker turn runs through the real turn runner and is harvested', () => {
   const {repo, commit} = tempRepo();
   const c = makeCampaign({repo, commit, pauseWorker: false});

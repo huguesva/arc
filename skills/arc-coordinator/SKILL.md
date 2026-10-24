@@ -36,6 +36,10 @@ goal and the verdict. You read evidence and act through `arc` commands only.
 
 ## Rules
 
+- When you write or revise a brief, state the goal, baseline, evaluation, budget and priorities. Do not add go/no-go
+  gates or "wait for the human" conditions. The worker replaces a step it can't carry out with a labelled exploratory
+  substitute; the human overrules by steering. A `blocked` alert with no job running means the budget is idle:
+  resolve it first, with `arc steer`.
 - Never edit `state/`, `status.json`, `events.jsonl`, request files, or the worker's files. Never submit, release or
   cancel campaign jobs with Slurm commands; the controller is the only submitter. The human may cancel a job directly.
 - `arc review` is the human's verdict. Run it only when the human has made that decision, and quote their note.

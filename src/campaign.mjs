@@ -64,7 +64,7 @@ export function validateConfig(c) {
   if (c.advisor !== undefined && c.advisor !== null) checkRole('advisor', c.advisor, errors, {advisor: true});
   if (c.cadence !== undefined) {
     for (const [k, v] of Object.entries(c.cadence)) {
-      if (!['changed_min', 'idle_min', 'busy_min'].includes(k)) errors.push(`cadence.${k} is not a known field`);
+      if (!['changed_min', 'idle_min', 'idle_max_min', 'busy_min'].includes(k)) errors.push(`cadence.${k} is not a known field`);
       else if (!Number.isInteger(v) || v < 0) errors.push(`cadence.${k} must be a non-negative integer`);
     }
   }
@@ -79,7 +79,7 @@ export function loadCampaign(dir) {
   if (!config) throw Error(`No campaign.json in ${dir}`);
   const errors = validateConfig(config);
   if (errors.length) throw Error(`Invalid campaign.json:\n- ${errors.join('\n- ')}`);
-  const cadence = {changed_min: 2, idle_min: 20, busy_min: 60, ...config.cadence};
+  const cadence = {changed_min: 2, idle_min: 20, idle_max_min: 240, busy_min: 60, ...config.cadence};
   return {dir, paths: p, config: {job_prefix: config.id, job_env: {}, advisor: null, ...config, cadence}};
 }
 

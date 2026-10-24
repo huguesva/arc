@@ -4,7 +4,8 @@
 
 1. Node 20 or newer, git, Slurm client commands, and the agent CLI you want (`codex` or `claude`) on PATH.
 2. Copy `templates/site.example.mjs` to `~/.config/arc/site.mjs` and adapt partitions, accounts and limits. Keep it out
-   of version control.
+   of version control. Export `notify` there only if you want to be told when an alert appears; by default arc sends
+   nothing.
 3. Optional: put `~/arc/bin` on PATH, or call `node ~/arc/bin/arc`.
 4. User systemd with lingering enabled, so campaigns keep running after you log out (`loginctl show-user $USER`).
 

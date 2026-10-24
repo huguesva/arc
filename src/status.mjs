@@ -37,7 +37,8 @@ export function buildStatus({c, records, obs, turns, claims, now, phase, control
   const role = (name, rs) => ({
     configured: !!c.config[name], active: rs.active ? {turn: rs.active.n, unit: rs.active.unit, started_at: isoNow(rs.active.started_at)} : null,
     last_started: rs.last_started_at ? isoNow(rs.last_started_at) : null, last_finished: rs.last_finished_at ? isoNow(rs.last_finished_at) : null,
-    next_due_at: rs.next_due_at ? isoNow(rs.next_due_at) : null, consecutive_failures: rs.consecutive_failures, last_error: rs.last_error,
+    next_due_at: rs.next_due_at ? isoNow(rs.next_due_at) : null, idle_streak: rs.idle_streak ?? 0,
+    consecutive_failures: rs.consecutive_failures, last_error: rs.last_error,
     health: rs.consecutive_failures >= 3 ? 'failing' : rs.consecutive_failures ? 'retrying' : 'ok', totals: rs.totals,
     ...(name === 'advisor' ? {audits: rs.audits} : {}),
   });

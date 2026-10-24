@@ -56,3 +56,12 @@ export function route(r, ctx) {
 //   return rows.reduce((n, row) => { const [gres, nodes] = row.split('|'); const m = gres.match(/gpu(?::\w+)?[:=](\d+)/); return n + (m ? Number(m[1]) * Number(nodes) : 0); }, 0);
 // }
 // ... in route(): if (poolGpus(ctx, 'shared') + r.gpus > 64) return {wait: 'shared pool full'};
+
+// Optional notifications. Without notify() arc sends nothing and files stay the channel. If exported, it is called once
+// when an alert first appears (again only after it clears and returns), with {campaign, code, message, ids}. Keep it
+// fast: errors are logged as notify_error and ignored. Alert codes are listed in docs/DESIGN.md §13.
+//
+// export function notify(alert, ctx) {
+//   if (!['blocked', 'role_failing', 'controller_error', 'uncertain_submission'].includes(alert.code)) return;
+//   ctx.exec('/path/to/your-notifier', [`arc ${alert.campaign}: ${alert.code}`, alert.message]);
+// }
