@@ -17,7 +17,7 @@ export function buildStatus({c, records, obs, turns, claims, now, phase, control
   if (obs.orphans.length) alert('orphan_job', 'campaign-tagged jobs in the queue that match no request record; their GPUs count against the budget', obs.orphans.map(o => o.id));
   if (obs.mutated.length) alert('request_mutated', 'request files changed after first sight; the original content is used and the edit ignored', obs.mutated);
   if (obs.badFiles.length) alert('bad_request_file', 'files in requests/ that are not <valid-id>.json are ignored', obs.badFiles);
-  if (obs.withdrawAfterSubmit.length) alert('withdraw_after_submit', 'withdrawal requested for already submitted requests; cancelling is a human action', obs.withdrawAfterSubmit);
+  if (obs.withdrawUncertain.length) alert('withdraw_uncertain', 'withdrawal waits until the uncertain submission is resolved (arc reconcile)', obs.withdrawUncertain);
   for (const [role, rs] of Object.entries(turns)) if (rs.consecutive_failures >= 3) alert('role_failing', `${role} failed ${rs.consecutive_failures} times in a row; retrying with backoff. Last error: ${rs.last_error}`, [role]);
   if (obs.tickError) alert('controller_error', `last tick failed: ${obs.tickError}`);
   const modified = records.filter(r => isActiveJob(r) && r.evaluator_status === 'modified').map(r => r.id);
@@ -30,7 +30,7 @@ export function buildStatus({c, records, obs, turns, claims, now, phase, control
   if (dupes.length) alert('duplicate_claim_id', 'claim ids appear more than once in findings.md', dupes);
 
   const job = r => ({request: r.id, job_id: r.job_id ?? null, state: r.slurm_state ?? r.status, gpus: r.request?.gpus ?? 0,
-    exit: r.exit_code ?? null, artifacts: path.join(c.paths.artifacts, r.id)});
+    exit: r.exit_code ?? null, withdrawn: r.withdrawn ?? null, artifacts: path.join(c.paths.artifacts, r.id)});
   const recent = records.filter(r => r.status === 'finished').sort((a, b) => (b.finished_at ?? '').localeCompare(a.finished_at ?? '')).slice(0, 15);
   const counts = {};
   for (const r of records) counts[r.status] = (counts[r.status] ?? 0) + 1;

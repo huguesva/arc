@@ -12,8 +12,9 @@ Your only task is to check that the running jobs are healthy, then end the turn.
    Do not reread the codebase, and do not rewrite `findings.md` or `notes.md`.
 3. If a job is clearly broken (a crash loop, NaN or diverging loss, no progress for a long time, writing to the wrong
    place), read `brief.md`, `findings.md` and the end of `notes.md` first, then act as in a normal turn: fix and
-   commit, file a corrected request under a new id, withdraw queued requests that depend on the broken job, or write
-   `blocked.md`. Add a dated entry to `notes.md` explaining what you saw.
+   commit, stop the broken job by creating `withdraw/<id>` with the reason (requests that depend on it are dropped with
+   it), file a corrected request under a new id, or write `blocked.md`. Add a dated entry to `notes.md` explaining what
+   you saw.
 
-You cannot cancel jobs; if a running job is wasting the budget, say so in your report and in `blocked.md` so the human
-can cancel it. Never use scheduler commands, and never push, merge or open pull requests.
+Stop a running job only when it is clearly broken, never because its numbers disappoint. Never use scheduler commands,
+and never push, merge or open pull requests.

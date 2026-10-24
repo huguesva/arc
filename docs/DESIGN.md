@@ -139,8 +139,11 @@ A request is one file, `requests/<id>.json`. The file name must equal the `id`.
   outside the campaign), so the worker can check before dropping a file.
 - **Requests are immutable.** On first sight the controller copies the request and its sha256 into `state/<id>.json`.
   Later edits to the file are ignored and raise `request_mutated`. A deleted file has no effect.
-- **Withdrawal.** The worker or `arc withdraw` creates `withdraw/<id>` with a reason. It takes effect only while the
-  request is `queued`; after submission it raises `withdraw_after_submit`, and cancellation stays a human action.
+- **Withdrawal.** The worker or `arc withdraw` creates `withdraw/<id>` with a reason. A `queued` request is dropped. A
+  `submitted` one, pending or running, is cancelled by the controller (§9) and finishes `CANCELLED` with the reason
+  recorded; requests that depend on it are then dropped (`dependency_failed`). A `submitting` or `uncertain` request
+  raises `withdraw_uncertain` and waits for `arc reconcile`. When to stop a running job is a prompt rule: superseded
+  or clearly broken, never to hide a result; a stopped run counts in "Variants tried".
 
 ## 6. Request lifecycle
 
@@ -238,6 +241,10 @@ Each tick:
   - A human resolves it with `arc reconcile <id> --adopt <job>` or `--abandon` (which makes it `dropped`). The command
     is written to `control/reconcile/` and applied by the controller on its next tick, so `state/` keeps one writer.
 - **Release.** `submitted` and not released: write the study if missing, then release.
+- **Cancel withdrawn.** A `submitted` record with a `withdraw/<id>` file is cancelled with `scancel`, only if `squeue`
+  shows its job id under the exact comment `arc:<campaign>:<id>`; otherwise `observe` finishes it. The record keeps
+  `withdrawn` (the reason), is not released, and a failed `scancel` is retried after 5 minutes. The event, the ledger
+  line and the worker's digest carry the reason. Requires a fresh queue view, like admission.
 - **Orphans.** Jobs in `squeue --me` whose comment starts with `arc:<campaign>:` but match no record's job id
   count toward `reserved` (GPUs parsed from `%b × %D`) and raise `orphan_job`.
 
@@ -433,7 +440,7 @@ per-job review queue does not scale. One legacy notebook reached 15,000+ unticke
   - `claims {total, awaiting_review, stale, audited_unsupported, accepted, rejected}`;
   - `alerts [{code, message, ids}]`.
 - Alert codes, all derived each tick:
-  - `uncertain_submission`, `orphan_job`, `request_mutated`, `withdraw_after_submit`;
+  - `uncertain_submission`, `orphan_job`, `request_mutated`, `withdraw_uncertain`;
   - `role_failing` (3 or more consecutive failures, with the provider's message), `controller_error` (last tick
     threw);
   - `evaluator_modified`, `findings_long`, `blocked`.
@@ -475,7 +482,7 @@ arc status [<id>] [--json]    one campaign, or all with GPU totals
 arc steer <id> -m "…" | -f <file>
 arc pause|resume <id> [submissions|worker|auditor]   (default: all three)
 arc priority <id> <request> <n>
-arc withdraw <id> <request> -m "reason"
+arc withdraw <id> <request> -m "reason"   queued: dropped; submitted (pending or running): cancelled
 arc claims <id>               claims with audit and review state, awaiting-review first
 arc review <id> <claim> accept|reject|needs-more -m "note"
 arc reconcile <id> <request> --adopt <job> | --abandon
@@ -517,6 +524,7 @@ inventory for shared pools. The engine adds and owns `--hold`, `--parsable`, `--
 | Every job id recorded at submission | receipt step + events + ledger line |
 | Budget counts pending and held jobs | `reserved` (§7) |
 | Jobs can't submit or cancel | static scan + PATH shims |
+| The controller cancels only this campaign's own jobs, and records why | `withdraw/<id>` → `scancel` only on an exact `squeue` token match; reason in record, events and ledger |
 | Prompts re-read every turn | composed per turn from files |
 | Ledger entry per transition | `events.jsonl` (+ optional `runs.md` lines) |
 | Only a human marks a conclusion Reviewed | `arc review` with the hash the human saw, in `control/reviews.jsonl` (same Unix user: convention, not permission) |
@@ -572,6 +580,9 @@ git in temporary repositories. Required cases:
 - status: every key present, alerts clear when conditions resolve;
 - the auditor wakes on a completed run, sees its log and diff, and checks it once; old `advisor` names keep working
   and an old-name turn runs read-only;
+- withdrawing a pending or running job cancels it, records the reason, frees the budget and drops its dependents; a
+  job the queue does not show under the request's token is never cancelled; an uncertain one raises
+  `withdraw_uncertain`;
 - SIGTERM → clean exit.
 
 Integration, run manually with explicit approval:
@@ -626,3 +637,5 @@ Live campaigns on the legacy controllers are not touched. They finish or drain o
 | 26 | The advisor is renamed auditor; `advisor` stays accepted as an old name (config, turns state, pause marker, CLI); every non-worker role is read-only | user |
 | 27 | The auditor checks claims, metric gaming in the code diffs, and finished runs' logs; at most one suggestion, only as the fix for a cited issue; no repeats without new evidence | user, from the prior-work review |
 | 28 | The auditor also wakes on completed runs it has not checked (oldest first, 20 per turn), not only on changed claims | user |
+| 29 | Withdrawing a submitted request, pending or running, makes the controller cancel its job (exact token match, reason recorded); replaces "cancellation stays a human action" | user |
+| 30 | The human's interactive assistant may steer, pause, restart, reconcile and withdraw superseded or broken requests without asking; it asks before withdrawing a healthy running job, changing budget or deadline, or stopping. Agents never touch the controller, arc's code or its units, and never run scheduler commands on campaign jobs | user |

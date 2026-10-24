@@ -46,8 +46,8 @@ function ledgerLine(ctx, text) {
 function finish(ctx, rec, {state, exit = null, elapsed = null}) {
   const from = rec.slurm_state;
   Object.assign(rec, {status: 'finished', slurm_state: state, exit_code: exit, elapsed_s: elapsed, finished_at: isoNow(ctx.now)});
-  ctx.log('finished', {request: rec.id, job: rec.job_id, from, to: state, exit});
-  rec.ledger_finished = ledgerLine(ctx, `- ${isoNow(ctx.now)} ${ctx.c.config.id}/${rec.id}: job ${rec.job_id} ${state}, exit ${exit ?? '?'}; artifacts ${path.join(ctx.c.paths.artifacts, rec.id)}`);
+  ctx.log('finished', {request: rec.id, job: rec.job_id, from, to: state, exit, ...(rec.withdrawn ? {withdrawn: rec.withdrawn} : {})});
+  rec.ledger_finished = ledgerLine(ctx, `- ${isoNow(ctx.now)} ${ctx.c.config.id}/${rec.id}: job ${rec.job_id} ${state}, exit ${exit ?? '?'}${rec.withdrawn ? ` (withdrawn: ${rec.withdrawn})` : ''}; artifacts ${path.join(ctx.c.paths.artifacts, rec.id)}`);
   ctx.save(rec);
 }
 
@@ -108,7 +108,8 @@ function scan(ctx, records, byId, obs) {
     if (rec.status === 'queued') {
       Object.assign(rec, {status: 'dropped', reason: `withdrawn: ${readText(path.join(c.paths.withdraw, id), '').trim() || 'no reason given'}`});
       ctx.save(rec); ctx.log('dropped', {request: id, reason: rec.reason});
-    } else if (isLive(rec)) obs.withdrawAfterSubmit.push(id);
+    } else if (rec.status === 'submitting' || rec.status === 'uncertain') obs.withdrawUncertain.push(id);
+    // submitted: cancelWithdrawn() cancels the job once the queue confirms it is this request's
   }
 }
 
@@ -149,6 +150,7 @@ function reconcile(ctx, records, obs) {
   const {c} = ctx;
   const prefix = `arc:${c.config.id}:`;
   const ours = ctx.slurm.queue().filter(r => r.comment.startsWith(prefix));
+  obs.ours = ours;
   const byToken = new Map();
   for (const row of ours) byToken.set(row.comment, [...(byToken.get(row.comment) ?? []), row]);
   for (const rec of records.filter(r => r.status === 'submitting' || r.status === 'uncertain' || r.status === 'queued')) {
@@ -174,6 +176,27 @@ function reconcile(ctx, records, obs) {
     const rec = byJob.get(row.id);
     if (!rec) { obs.orphans.push({id: row.id, name: row.name, gpus: row.gpus}); continue; }
     if (row.held && rec.released && rec.status === 'submitted') { rec.released = false; ctx.save(rec); ctx.log('still_held', {request: rec.id, job: rec.job_id}); }
+  }
+}
+
+// --- withdrawn after submission: cancel the job, only if the queue shows it under this request's exact token ---
+function cancelWithdrawn(ctx, records, obs) {
+  const {c} = ctx;
+  const queued = new Map(obs.ours.map(row => [row.id, row]));
+  for (const rec of records) {
+    if (rec.status !== 'submitted' || TERMINAL.has(rec.slurm_state) || !rec.job_id) continue;
+    const file = path.join(c.paths.withdraw, rec.id);
+    if (!fs.existsSync(file)) continue;
+    if (queued.get(rec.job_id)?.comment !== token(c, rec.id)) continue; // not in the queue as ours: observe() finishes it
+    if (rec.cancel_requested_at && ctx.now - Date.parse(rec.cancel_requested_at) < 5 * MIN) continue;
+    const reason = readText(file, '').trim() || 'no reason given';
+    rec.cancel_requested_at = isoNow(ctx.now);
+    try {
+      ctx.slurm.cancel([rec.job_id]);
+      Object.assign(rec, {withdrawn: reason, last_error: null});
+      ctx.log('cancel_requested', {request: rec.id, job: rec.job_id, reason});
+    } catch (err) { rec.last_error = `cancel: ${errText(err)}`; ctx.log('cancel_retry', {request: rec.id, job: rec.job_id, error: rec.last_error}); }
+    ctx.save(rec);
   }
 }
 
@@ -313,7 +336,7 @@ export function tick(ctx) {
   const {c, now} = ctx;
   ctx.save = makeSave(ctx);
   const flags = controlFlags(c);
-  const obs = {orphans: [], mutated: [], badFiles: [], withdrawAfterSubmit: [], queue: [], reserved: 0, tickError: ctx.lastError ?? null};
+  const obs = {orphans: [], ours: [], mutated: [], badFiles: [], withdrawUncertain: [], queue: [], reserved: 0, tickError: ctx.lastError ?? null};
   const records = loadRecords(c);
   const byId = new Map(records.map(r => [r.id, r]));
   const turns = loadTurns(c);
@@ -331,7 +354,8 @@ export function tick(ctx) {
   step('scan', () => scan(ctx, records, byId, obs));
   step('reconcile-commands', () => applyReconcile(ctx, byId));
   const reconciled = step('reconcile', () => reconcile(ctx, records, obs));
-  step('release', () => { for (const rec of records) if (rec.status === 'submitted' && !TERMINAL.has(rec.slurm_state) && (!rec.released || !rec.study_recorded || !rec.ledger_submitted)) releaseRecord(ctx, rec); });
+  if (reconciled) step('cancel', () => cancelWithdrawn(ctx, records, obs));
+  step('release', () => { for (const rec of records) if (rec.status === 'submitted' && !TERMINAL.has(rec.slurm_state) && !rec.withdrawn && (!rec.released || !rec.study_recorded || !rec.ledger_submitted)) releaseRecord(ctx, rec); });
   // Without a fresh view of the queue, orphans and adoptions are unknown: admitting would be unsafe.
   if (reconciled) step('admit', () => admit(ctx, records, byId, obs, flags));
   else obs.reserved = records.filter(isLive).reduce((n, r) => n + (r.request?.gpus ?? 0), 0);

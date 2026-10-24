@@ -33,7 +33,12 @@ evidence; its findings are nonbinding.
 ## Rules for requests and jobs
 
 - **Requests are immutable.** Never edit or delete a request file. To change an experiment, write a new id (you may set
-  `supersedes`). To cancel one that has not been submitted yet, create `withdraw/<id>` containing the reason.
+  `supersedes`).
+- **To stop an experiment**, create `withdraw/<id>` containing the reason. A queued request is dropped; a submitted one,
+  pending or running, is cancelled by the controller. Requests that depend on it through `after` are dropped with it.
+  Stop a running job when steering has superseded it or it is clearly broken (NaN or diverging loss, a crash loop, the
+  wrong code or data), never to avoid a disappointing result. A stopped run counts in "Variants tried", and its
+  partial outputs stay in its artifacts.
 - **Jobs run from a frozen copy of the commit**, with the working directory at the source root (`$ARC_SOURCE`). Write
   every output under `$ARC_RUN_DIR` and list the important ones in `expected_outputs`. `ARC_REQUEST_ID` and `ARC_SEED`
   are also set. Thread counts follow the allocated CPUs. Check once that the job imports your code from `$ARC_SOURCE`
@@ -42,8 +47,9 @@ evidence; its findings are nonbinding.
   missing.
 - **A crashed job is not a result.** A job that ended `PREEMPTED`, `NODE_FAIL`, `OUT_OF_MEMORY` or `TIMEOUT` says
   nothing about its hypothesis: fix the resources or resubmit under a new id.
-- **Never use scheduler commands** (`sbatch`, `salloc`, `scancel`, `scontrol`). They are blocked inside jobs, and a
-  script that mentions them is rejected. Use `after` to chain jobs (for example, evaluation after training).
+- **Never use scheduler commands** (`sbatch`, `salloc`, `scancel`, `scontrol`); stop jobs through `withdraw/` only. They
+  are blocked inside jobs, and a script that mentions them is rejected. Use `after` to chain jobs (for example,
+  evaluation after training).
 - Data and checkpoints are not in git. Refer to them by absolute path and record versions or hashes in `data_provenance`.
 - One request can run a whole sweep inside the job. Batching many small variants into one request is cheaper than many
   tiny requests, and each request costs a wake-up and a turn.
@@ -123,4 +129,5 @@ requests: merging into the project is the human's decision, made outside the cam
 ## Files you must not edit
 
 `campaign.json`, `brief.md`, `steering.md`, `control/`, `state/`, `status.json`, `events.jsonl`, `turns/`, and existing
-request files. Job artifacts are written by jobs, not by you.
+request files. Job artifacts are written by jobs, not by you. Never edit, restart or stop the controller, arc's own code
+or its systemd units: you act on the campaign only through request and withdraw files.

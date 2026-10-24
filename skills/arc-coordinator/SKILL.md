@@ -25,11 +25,11 @@ evidence and act through `arc` commands only.
 
 | Want | Command |
 |---|---|
-| Start a campaign | `arc start <dir>`, once `~/.config/arc/site.mjs` exists (the user's cluster config; it lives only there) |
+| Start a campaign | `arc start <dir>`, once `~/.config/arc/site.mjs` exists (the user's cluster config; it lives only there). Where policy forbids agent sessions from leaving services running, prepare with `arc start <dir> --no-enable` and let the human run `arc start <dir>` |
 | Change direction | `arc steer <id> -m "..."` (both roles read it next turn) |
 | Accept, reject or ask more of a claim | `arc review <id> C3 accept\|reject\|needs-more --hash <h> -m "note"` (h from `arc claims`; only when the human decides) |
 | Run something first | `arc priority <id> <request> <n>` |
-| Drop a queued request | `arc withdraw <id> <request> -m "reason"` |
+| Stop an experiment | `arc withdraw <id> <request> -m "reason"`: a queued request is dropped, a submitted job (pending or running) is cancelled by the controller, and its dependents are dropped |
 | Hold new submissions or turns | `arc pause <id> [submissions\|worker\|auditor]`, `arc resume ...` |
 | Resolve an uncertain submission | `arc reconcile <id> <request> --adopt <job>` after checking `squeue`/`sacct`, or `--abandon` |
 | Pick up a new arc version | `arc restart <id>` (turns and jobs continue) |
@@ -41,8 +41,14 @@ evidence and act through `arc` commands only.
   gates or "wait for the human" conditions. The worker replaces a step it can't carry out with a labelled exploratory
   substitute; the human overrules by steering. A `blocked` alert with no job running means the budget is idle:
   resolve it first, with `arc steer`.
-- Never edit `state/`, `status.json`, `events.jsonl`, request files, or the worker's files. Never submit, release or
-  cancel campaign jobs with Slurm commands; the controller is the only submitter. The human may cancel a job directly.
+- You act for the human coordinator. Without asking each time, you may read anything, run `arc status` and `arc claims`,
+  `arc steer` with what the human decided, `arc pause`/`resume`, `arc restart`, `arc priority`, `arc reconcile` after
+  checking `squeue`/`sacct`, and `arc withdraw` for a request that is superseded or clearly broken. Ask first before
+  withdrawing a healthy running job (it is the worker's experiment: steer instead), changing the budget or deadline,
+  `arc stop`, or `--cancel-jobs`.
+- Never edit `state/`, `status.json`, `events.jsonl`, request files, or the worker's files. Never run `sbatch`, `scancel`
+  or `scontrol` on campaign jobs: cancel through `arc withdraw`, so the record keeps the reason. The controller is the
+  only submitter.
 - `arc review` is the human's verdict. Run it only when the human has made that decision, and quote their note.
 - Report honestly: separate queued from running, exploratory (modified evaluator) from headline, audited from reviewed.
   Give job ids, request ids and file paths for every claim you relay.

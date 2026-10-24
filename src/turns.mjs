@@ -119,7 +119,7 @@ export function digest(c, role, {status, records, claims, rs, runIds = []}) {
   if (s.alerts.length) out.push('Alerts:', ...s.alerts.map(a => `- ${a.code}: ${a.message}`));
   if (s.queue.length) out.push('Queue (in admission order):', ...s.queue.slice(0, 40).map(q => `- \`${q.id}\` priority ${q.priority}: waiting for ${q.waiting_for}${q.last_error ? ` (last error: ${q.last_error.slice(0, 300)})` : ''}`));
   if (s.jobs.active.length) out.push('Active jobs:', ...s.jobs.active.map(j => `- \`${j.request}\` job ${j.job_id ?? '?'} ${j.state} (${j.gpus} GPUs)`));
-  if (s.jobs.recent.length) out.push('Recently finished:', ...s.jobs.recent.map(j => `- \`${j.request}\` job ${j.job_id} ${j.state} exit ${j.exit ?? '?'} → ${j.artifacts}`));
+  if (s.jobs.recent.length) out.push('Recently finished:', ...s.jobs.recent.map(j => `- \`${j.request}\` job ${j.job_id} ${j.state} exit ${j.exit ?? '?'}${j.withdrawn ? ` (withdrawn: ${j.withdrawn})` : ''} → ${j.artifacts}`));
   const rej = recentRejections(records, rs.last_started_at);
   if (rej.length) out.push('Requests rejected since your last turn (file a new id after fixing):', ...rej);
   const blocked = readText(c.paths.blocked, '').trim();

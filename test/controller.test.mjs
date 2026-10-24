@@ -192,7 +192,7 @@ test('dependencies wait, then proceed on COMPLETED or drop on failure', () => {
   assert.match(record(c, 'eval2').reason, /dependency_failed/);
 });
 
-test('requests are immutable; withdrawal only before submission', () => {
+test('requests are immutable; a withdrawn queued request is dropped', () => {
   const {c, commit} = setup({gpu_cap: 2});
   const ctx = context(c);
   writeRequest(c, request(commit, {id: 'sub', gpus: 2}));
@@ -200,13 +200,58 @@ test('requests are immutable; withdrawal only before submission', () => {
   tick(ctx);
   writeRequest(c, request(commit, {id: 'sub', gpus: 2, seed: 99}));
   fs.writeFileSync(path.join(c.paths.withdraw, 'wait'), 'not needed\n');
-  fs.writeFileSync(path.join(c.paths.withdraw, 'sub'), 'too late\n');
   tick(ctx);
   assert.equal(record(c, 'sub').request.seed, 1, 'original content kept');
   assert.equal(record(c, 'wait').status, 'dropped');
-  const codes = status(c).alerts.map(a => a.code);
-  assert.ok(codes.includes('request_mutated'));
-  assert.ok(codes.includes('withdraw_after_submit'));
+  assert.ok(status(c).alerts.map(a => a.code).includes('request_mutated'));
+});
+
+test('withdrawing a running job cancels it, records why, frees the budget and drops its dependents', () => {
+  const {c, commit} = setup({gpu_cap: 4});
+  const ctx = context(c);
+  writeRequest(c, request(commit, {id: 'train'}));
+  writeRequest(c, request(commit, {id: 'score', gpus: 0, after: ['train']}));
+  tick(ctx);
+  const job = record(c, 'train').job_id;
+  ctx.slurm.set(job, 'RUNNING');
+  ctx.now += MIN; tick(ctx);
+  fs.writeFileSync(path.join(c.paths.withdraw, 'train'), 'loss is NaN since step 2k\n');
+  ctx.now += MIN; tick(ctx);
+  assert.equal(ctx.slurm.jobs.get(job).state, 'CANCELLED', 'the controller cancelled it');
+  assert.ok(ctx.events.some(e => e.type === 'cancel_requested' && e.request === 'train' && /NaN/.test(e.reason)));
+  ctx.now += MIN; tick(ctx);
+  const rec = record(c, 'train');
+  assert.deepEqual([rec.status, rec.slurm_state], ['finished', 'CANCELLED']);
+  assert.match(rec.withdrawn, /NaN/);
+  assert.equal(record(c, 'score').status, 'dropped', 'its dependents are dropped');
+  assert.equal(status(c).budget.reserved, 0);
+  assert.match(status(c).jobs.recent[0].withdrawn, /NaN/);
+});
+
+test("a withdrawal never cancels a job the queue does not show under the request's own token", () => {
+  const {c, commit} = setup();
+  const ctx = context(c);
+  writeRequest(c, request(commit));
+  tick(ctx);
+  const job = record(c, 'r1').job_id;
+  ctx.slurm.jobs.get(job).comment = 'arc:other-campaign:r1'; // e.g. a mistyped arc reconcile --adopt
+  fs.writeFileSync(path.join(c.paths.withdraw, 'r1'), 'superseded\n');
+  ctx.now += MIN; tick(ctx);
+  assert.equal(ctx.slurm.jobs.get(job).state, 'PENDING');
+  assert.ok(!ctx.events.some(e => e.type === 'cancel_requested'));
+});
+
+test('withdrawing an uncertain submission raises withdraw_uncertain and cancels nothing', () => {
+  const {c, commit} = setup();
+  const ctx = context(c);
+  ctx.slurm.plan.push('timeout-none');
+  writeRequest(c, request(commit));
+  tick(ctx);
+  assert.equal(record(c, 'r1').status, 'uncertain');
+  fs.writeFileSync(path.join(c.paths.withdraw, 'r1'), 'not needed\n');
+  ctx.now += MIN; tick(ctx);
+  assert.ok(status(c).alerts.some(a => a.code === 'withdraw_uncertain'));
+  assert.equal(record(c, 'r1').status, 'uncertain');
 });
 
 test('deadline closes admission but keeps jobs; evaluator status is recorded', () => {

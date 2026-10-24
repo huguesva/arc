@@ -27,7 +27,7 @@ const HELP = `arc — Autonomous Research Controller
   arc steer <id> -m "text" | -f file [-t title]
   arc pause|resume <id> [submissions|worker|auditor]
   arc priority <id> <request> <n>
-  arc withdraw <id> <request> -m "reason"
+  arc withdraw <id> <request> -m "reason"   queued: dropped; submitted (pending or running): cancelled
   arc claims <id>
   arc review <id> <claim> accept|reject|needs-more --hash <h> -m "note"   (h as shown by arc claims)
   arc reconcile <id> <request> --adopt <job> | --abandon
@@ -242,6 +242,7 @@ export async function main(argv) {
       const c = campaign(pos[0]);
       const p = path.join(c.paths.withdraw, need(pos[1], 'request'));
       writeAtomic(p, `${need(opt.m, 'reason (-m)')}\n`);
+      console.log(`withdrawal of ${pos[1]} recorded; the controller drops it if queued or cancels its job if submitted`);
       return 0;
     }
     case 'claims': {
