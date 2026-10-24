@@ -40,10 +40,10 @@ export function buildStatus({c, records, obs, turns, claims, now, phase, control
     next_due_at: rs.next_due_at ? isoNow(rs.next_due_at) : null, idle_streak: rs.idle_streak ?? 0,
     consecutive_failures: rs.consecutive_failures, last_error: rs.last_error,
     health: rs.consecutive_failures >= 3 ? 'failing' : rs.consecutive_failures ? 'retrying' : 'ok', totals: rs.totals,
-    ...(name === 'advisor' ? {audits: rs.audits} : {}),
+    ...(name === 'auditor' ? {audits: rs.audits} : {}),
   });
   return {
-    schema: 'arc.status/1',
+    schema: 'arc.status/2',
     campaign: c.config.id,
     generated_at: isoNow(now),
     controller: {...controller, heartbeat_at: isoNow(now), phase},
@@ -52,7 +52,7 @@ export function buildStatus({c, records, obs, turns, claims, now, phase, control
     counts,
     queue: obs.queue,
     jobs: {active: records.filter(isActiveJob).map(job), recent: recent.map(job)},
-    roles: {worker: role('worker', turns.worker), advisor: role('advisor', turns.advisor)},
+    roles: {worker: role('worker', turns.worker), auditor: role('auditor', turns.auditor)},
     claims: claimCounts(claims),
     blocked: blocked || null,
     alerts,

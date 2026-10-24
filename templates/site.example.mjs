@@ -7,7 +7,7 @@ export const runs_root = '/scratch/YOUR_USER/arc';
 // PATH for agent turns and jobs: must contain node, git and the agent CLIs.
 export const path = process.env.PATH;
 
-// Cluster rules shown to the worker and the advisor in every prompt.
+// Cluster rules shown to the worker and the auditor in every prompt.
 export const prompt = `
 - Heavy computation belongs in jobs, not on the login node.
 - GPU nodes have 8 GPUs; multi-node jobs use whole nodes.

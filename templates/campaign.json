@@ -15,7 +15,7 @@
     "model": "MODEL_ID",
     "effort": "high"
   },
-  "advisor": {
+  "auditor": {
     "agent": "claude",
     "model": "MODEL_ID",
     "every_min": 60

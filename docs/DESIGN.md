@@ -4,7 +4,8 @@ Status: **draft for approval** (2026-10-21). Nothing is implemented until this d
 
 arc (Autonomous Research Controller) is a small, reusable harness for autonomous research campaigns on a Slurm
 cluster. One AI coding agent does the research. A deterministic controller owns scheduling, budgets and
-provenance. An optional second model audits claims against raw evidence. A human sets the goal and the verdict.
+provenance. An optional second model audits claims and finished runs against raw evidence. A human sets the goal
+and the verdict.
 
 It replaces per-project controllers that were copied and patched for each campaign. The semantics of
 those controllers are kept; their incidental complexity is not.
@@ -14,7 +15,7 @@ those controllers are kept; their incidental complexity is not.
 | Role | Kind | Responsibility | Runs |
 |---|---|---|---|
 | Worker | LLM coding agent (Codex or Claude), full access to its worktree | Edits code, commits, writes immutable job requests, analyses results, maintains `findings.md` | One turn at a time, woken by the controller |
-| Advisor (optional) | LLM, read-only | Audits the claims in `findings.md` against raw evidence (§12) | On new claims or results, at most every `advisor.every_min` |
+| Auditor (optional) | LLM, read-only | Checks the claims in `findings.md` and completed runs against raw evidence, including metric gaming (§12) | On new claims or completed runs, at most every `auditor.every_min` |
 | Controller | Node, no LLM | Validates, budgets, freezes source, submits, reconciles, schedules turns, writes status | systemd user service, 30 s tick |
 | Coordinator | Human, optionally with an interactive agent session | Writes the brief, steers, reviews **claims** (§13) | Whenever they look |
 
@@ -53,7 +54,7 @@ The worker never calls Slurm. The controller never decides what to run.
 
 <runs_root>/<id>/                       one campaign (runs_root from site.mjs, on scratch)
   campaign.json  brief.md  steering.md  human
-  control/  STOP  PAUSE_SUBMISSIONS  PAUSE_WORKER  PAUSE_ADVISOR  priority.json  reviews.jsonl
+  control/  STOP  PAUSE_SUBMISSIONS  PAUSE_WORKER  PAUSE_AUDITOR  priority.json  reviews.jsonl
             reconcile/<request>.json    human, via the CLI (reconcile commands are applied once, then renamed)
   requests/<id>.json                    worker, create-only
   withdraw/<id>                         worker or `arc withdraw`; content = reason
@@ -87,7 +88,7 @@ The worker never calls Slurm. The controller never decides what to run.
   "job_env": { "PYTHONPATH": "$ARC_SOURCE/src:$ARC_SOURCE" },
   "evaluator": { "commit": "<40 hex>", "paths": ["eval/", "data/splits/test.txt"] },
   "worker":  { "agent": "codex", "model": "<model id>", "profile": "<optional>", "effort": "high", "args": [] },
-  "advisor": { "agent": "claude", "model": "<model id>", "every_min": 60 },
+  "auditor": { "agent": "claude", "model": "<model id>", "every_min": 60 },
   "cadence": { "changed_min": 2, "idle_min": 20, "idle_max_min": 240, "busy_min": 60 },
   "ledger_md": "/path/to/notebook/runs.md",
   "study_spool": "/path/to/observer/spool"
@@ -95,8 +96,9 @@ The worker never calls Slurm. The controller never decides what to run.
 ```
 
 - `deadline` is required: an ISO time or the literal `"none"`. That makes it a conscious choice, never a default.
-- `advisor`, `evaluator`, `ledger_md`, `study_spool`, `cadence`, `job_prefix` (defaults to `id`) and `job_env` are
-  optional.
+- `auditor`, `evaluator`, `ledger_md`, `study_spool`, `cadence`, `job_prefix` (defaults to `id`) and `job_env` are
+  optional. `advisor`, the auditor's old name, is still accepted in `campaign.json`, `state/turns.json`,
+  `PAUSE_ADVISOR` and `arc pause`.
 - The worker may set `checkin: {model?, effort?, args?}`: overrides used only for scheduled check-ins (§11).
 - Each role may set `bin` (absolute path of the agent CLI, e.g. a wrapper script), `profile`, `effort`, `args` and `env`.
 - `job_env` values are expanded in the job under `set -u`: write `${VAR:-}` for variables that may be unset.
@@ -272,16 +274,17 @@ and, by default, the code that scores it.
 `{ok, report, model, usage, error}`.
 
 - `codex`: `codex exec --json --output-last-message`. The worker gets `--sandbox danger-full-access --cd <worktree>
-  --add-dir <campaign>`; the advisor gets `--sandbox read-only`.
-- `claude`: `claude --print --output-format stream-json --verbose --no-session-persistence`. The advisor's tools are
-  limited to `Read,Glob,Grep`.
+  --add-dir <campaign>`; the auditor gets `--sandbox read-only`.
+- `claude`: `claude --print --output-format stream-json --verbose --no-session-persistence`. The auditor's tools are
+  limited to `Read,Glob,Grep` plus read-only `git show`, `git diff` and `git log`.
+- Every role other than the worker is read-only.
 - The same credentials home is used for both roles unless a role sets `env`, so a separate home can't silently run
   out of credits.
 
 **Cadence.**
 
 - Worker fingerprint = hash of the news state of every request (accepted, rejected, dropped, or finished with its
-  final Slurm state), `brief.md`, `steering.md`, the latest advisor report and the human reviews. Progress in between
+  final Slurm state), `brief.md`, `steering.md`, the latest auditor report and the human reviews. Progress in between
   (queued, held, released, PENDING → RUNNING) is not news, so a long job costs about two turns plus the `busy_min`
   check-ins.
 - **Worker** is due when no worker turn is active, PAUSE_WORKER is absent, and at least one holds:
@@ -301,11 +304,12 @@ and, by default, the code that scores it.
   calls; only if something is broken does it read the brief and findings and act. `worker.checkin` can make these
   turns cheaper (lower effort or another model). A turn costs mostly the agent's tool loop, not the prompt, so the
   saving comes from the short task; nothing is capped.
-- **Advisor** is due when configured, no advisor turn is active, PAUSE_ADVISOR is absent, `every_min` has passed since
-  its last start, and some live claim has neither a valid audit nor a text the advisor already answered in a
-  successful turn (so a claim it cannot parse is not re-sent forever). New results reach it when the worker updates
-  the claim. Its prompt lists each cited request's record, commit and diff size; the Claude advisor may run only
-  `git show`, `git diff` and `git log`. The advisor runs independently of the worker.
+- **Auditor** is due when configured, no auditor turn is active, PAUSE_AUDITOR is absent, `every_min` has passed since
+  its last start, and there is something it has not answered in a successful turn: a live claim without a valid audit,
+  or a completed run it has not checked. Answered claim texts and checked runs are not re-sent, so something it cannot
+  parse is not sent forever. Runs go oldest first, at most 20 per turn. Its prompt lists each cited request's and each
+  run's record, commit, diff size against the base commit and log path, and its own previous report. The auditor runs
+  independently of the worker.
 
 **Prompt**, composed fresh every turn and archived:
 
@@ -323,8 +327,8 @@ and, by default, the code that scores it.
    - alerts and this role's own health;
    - `findings.md` with its line count, plus a consolidation nudge above 150 lines;
    - `blocked.md`;
-   - for the worker, the audit and human review state of each claim, with notes; for the advisor, the claims that
-     changed and their evidence paths.
+   - for the worker, the audit and human review state of each claim, with notes; for the auditor, the claims that
+     changed, the completed runs to check, their evidence paths and its own previous report.
 
 **Worker files.**
 
@@ -333,18 +337,31 @@ and, by default, the code that scores it.
   claims (one line each).
 - `notes.md`: an append-only lab notebook.
 - `blocked.md`: written when a task looks impossible, contradictory or mis-specified. It is shown at the top of
-  status and to the advisor, and does not stop anything.
+  status and to the auditor, and does not stop anything.
 - When a procedure, gate or success criterion in the brief can't be carried out or can't discriminate, the worker
   protocol says not to wait: write `blocked.md`, adopt the most defensible feasible substitute, label what depends on
   it exploratory, and carry on. The pinned evaluator code, claim reviews and the controller's files are excluded. This
   is a prompt rule (principle 8); the brief template asks for priorities and predictions rather than go/no-go gates.
 
-## 12. Advisor protocol (auditor)
+## 12. Auditor protocol
 
-The advisor checks claims; it doesn't plan research.
+The auditor checks the work against raw evidence; it doesn't plan research. It was called the advisor until decision
+26: the old name invited idea generation, and every idea costs the worker a turn.
 
-- **Input**: the claims in `findings.md` that are new or changed since its last audit, their evidence paths, the
-  diffs of the cited commits, the request records and logs. It never reads the worker's turn report.
+- **Input**: the claims in `findings.md` that are new or changed since its last audit, the completed runs it has not
+  checked, their evidence paths, the diffs of the commits behind them, the request records and logs, and its own
+  previous report. It never reads the worker's turn report; it may read `notes.md` only for the worker's answers to
+  its points.
+- **Three checks**, each grounded in a file, job id, log line or number:
+  1. *Claims*: does each claim follow from the artifacts (checklist below)?
+  2. *Metric gaming*: does a code diff move the metric without improving the method? Scoring, filtering or
+     post-processing changed (inside or outside the pinned paths), outputs dropped or selected before scoring, a
+     denominator without failures, a changed panel, seed, sample count or reference set, copied or hard-coded answers,
+     disabled limits or checks, a test panel reused for selection.
+  3. *Finished runs*: does a log or output make a result unreliable or waste budget? NaN, loss or gradient-norm
+     spikes, late validation-loss rise, restart or OOM loops, code imported from outside `$ARC_SOURCE`, wrong
+     checkpoint or data, missing outputs. Running jobs stay with the worker's check-ins, since the worker is the one who
+     can act.
 - **Per claim**, a fixed checklist answered yes / no / can't tell:
   - Does the number match the artifact?
   - Do the baseline and the arm use the same protocol and denominator?
@@ -355,13 +372,18 @@ The advisor checks claims; it doesn't plan research.
 - **Output**, fixed shape:
   - one line per claim, `C<n>: supported | unsupported | can't tell — <evidence>`, which the controller parses into
     `state/claims.json`;
-  - then `Material issues: none` or a list where every item cites a file, job id or number.
-  - Only issues that would change a conclusion or the next decision count. No suggested experiments, no style notes.
+  - then `Material issues: none` or a list where every item cites a file, job id or number;
+  - then at most one `Suggestion:` line, only as the fix for an issue it cited. Never a new direction, ablation or
+    experiment that is not a fix.
+  - Only issues that would change a conclusion or the next decision count. No style notes.
+- **No repeats**: it does not raise a point from its previous report again without new evidence; a point the worker
+  answered in `notes.md` is closed unless the evidence changed.
 - **Framing in the prompt**: "Most audits find no material issues; saying so is a correct and complete result."
-- The worker sees the per-claim verdicts in its digest and the advisor's latest report, labelled nonbinding
-  (principle 8: the report shape is a prompt rule, not filtered in code). The worker may disagree, giving the
-  reason in `notes.md`.
-- `status.json` shows the advisor's flag rate. A rate near 100% is a prompt problem to fix.
+- The worker sees the per-claim verdicts in its digest and the auditor's latest report, labelled nonbinding
+  (principle 8: the report shape is a prompt rule, not filtered in code). It acts on an issue or the suggestion when
+  that would change the current answer or its next decision, and otherwise declines in one line in `notes.md`.
+- `status.json` shows the auditor's flag rate. Near 100% means it is nagging; near 0% over many audits may mean it is
+  rubber-stamping. Either is a prompt problem to fix.
 
 ## 13. Claims, review, ledger, status
 
@@ -381,7 +403,7 @@ per-job review queue does not scale. One legacy notebook reached 15,000+ unticke
   - A retracted claim moves to the superseded section with its id.
 - **Parsing.** Each tick the controller parses the claim blocks into `state/claims.json`, with the sha256 of each
   block's text.
-- **Audit.** The advisor's verdict lines (§12) attach to a claim together with the hash they were made against.
+- **Audit.** The auditor's verdict lines (§12) attach to a claim together with the hash they were made against.
 - **Review.** `arc review <campaign> C3 accept|reject|needs-more --hash <h> -m "note"` appends
   `{claim, verdict, note, at, hash}` to `control/reviews.jsonl`.
   - `<h>` is the hash prefix shown by `arc claims`; if the claim changed since, the review is refused, so a verdict
@@ -397,14 +419,15 @@ per-job review queue does not scale. One legacy notebook reached 15,000+ unticke
   `{at, type, request?, job?, from?, to?, detail}`. If `ledger_md` is set, a plain line (no checkbox, no review
   expectation) is appended under `flock` on submission (with the job id) and on finish. Point it at a file only arc
   writes: a notebook rewritten by other tools under another lock can lose appended lines.
-- `status.json` (`schema: "arc.status/1"`) has every key present on every tick:
+- `status.json` (`schema: "arc.status/2"`; `/2` renamed `roles.advisor` to `roles.auditor`) has every key present on
+  every tick:
   - `controller {pid, version, started_at, heartbeat_at, phase}`, where phase is one of `running`, `paused`,
     `deadline_closed`, `stopped`, `finished`;
   - `deadline {at, remaining_s, closed}`;
   - `budget {cap, reserved, free, orphan_gpus}`;
   - `counts` by status, and `queue [{id, priority, waiting_for}]`;
   - `jobs {active, recent}`;
-  - `roles.{worker,advisor} {active, last_started, last_finished, next_due_at, idle_streak, consecutive_failures,
+  - `roles.{worker,auditor} {active, last_started, last_finished, next_due_at, idle_streak, consecutive_failures,
     last_error, health}`;
   - `blocked`;
   - `claims {total, awaiting_review, stale, audited_unsupported, accepted, rejected}`;
@@ -450,7 +473,7 @@ arc start <dir|id>            validate config, files, site, agent binaries and s
                               Idempotent.
 arc status [<id>] [--json]    one campaign, or all with GPU totals
 arc steer <id> -m "…" | -f <file>
-arc pause|resume <id> [submissions|worker|advisor]   (default: all three)
+arc pause|resume <id> [submissions|worker|auditor]   (default: all three)
 arc priority <id> <request> <n>
 arc withdraw <id> <request> -m "reason"
 arc claims <id>               claims with audit and review state, awaiting-review first
@@ -501,7 +524,7 @@ inventory for shared pools. The engine adds and owns `--hold`, `--parsable`, `--
 
 ## 18. Non-goals
 
-Never added: pilot gates; caps on turns, calls, jobs or job duration; model-turn timeouts; advisor approval steps;
+Never added: pilot gates; caps on turns, calls, jobs or job duration; model-turn timeouts; auditor approval steps;
 built-in notifications (files are the channel; a site may opt in with `notify`, §16); stopping rules the human didn't ask for; permanent failure after N
 retries.
 
@@ -521,7 +544,7 @@ src/freeze.mjs               ~90   archive, provenance, evaluator check, run.sh
 src/turns.mjs                ~150  cadence, prompt composition, launch, harvest
 src/agents.mjs               ~80   codex and claude adapters
 src/status.mjs               ~100  status and alerts
-prompts/worker.md  prompts/advisor.md
+prompts/worker.md  prompts/worker-checkin.md  prompts/auditor.md
 templates/campaign.json brief.md steering.md arc@.service site.example.mjs
 skills/arc-coordinator/SKILL.md     how an interactive session reads and steers a campaign
 docs/DESIGN.md quickstart.md
@@ -547,6 +570,8 @@ git in temporary repositories. Required cases:
 - PATH shims make `sbatch` fail inside `run.sh`;
 - turn harvest: success, failure with provider message, unit vanished; backoff schedule; cadence rules;
 - status: every key present, alerts clear when conditions resolve;
+- the auditor wakes on a completed run, sees its log and diff, and checks it once; old `advisor` names keep working
+  and an old-name turn runs read-only;
 - SIGTERM → clean exit.
 
 Integration, run manually with explicit approval:
@@ -564,7 +589,7 @@ Integration, run manually with explicit approval:
 3. **Turns**: adapters, systemd-run launch, harvest, cadence, prompt composition; tested with a stub agent (no
    tokens).
 4. **CLI and unit**: all verbs, `arc@.service`, stop and restart verification.
-5. **Prompts and docs**: worker and advisor protocols, coordinator skill, quickstart. First real campaign: a fresh
+5. **Prompts and docs**: worker and auditor protocols, coordinator skill, quickstart. First real campaign: a fresh
    campaign on a project with no live controller.
 
 Live campaigns on the legacy controllers are not touched. They finish or drain on their own controllers.
@@ -598,3 +623,6 @@ Live campaigns on the legacy controllers are not touched. They finish or drain o
 | 23 | An infeasible procedure, gate or criterion in the brief never idles the campaign: the worker substitutes, labels it exploratory and carries on (prompt rule); briefs state priorities, not gates | review of the order-free-causal campaign, accepted by user |
 | 24 | Idle-timer wake-ups with no news back off: `idle_min` doubling to `idle_max_min` (default 240); any other turn resets | review of the order-free-causal campaign, accepted by user |
 | 25 | Notifications only through an optional `site.notify` hook, once per new alert; the engine sends nothing by default | user |
+| 26 | The advisor is renamed auditor; `advisor` stays accepted as an old name (config, turns state, pause marker, CLI); every non-worker role is read-only | user |
+| 27 | The auditor checks claims, metric gaming in the code diffs, and finished runs' logs; at most one suggestion, only as the fix for a cited issue; no repeats without new evidence | user, from the prior-work review |
+| 28 | The auditor also wakes on completed runs it has not checked (oldest first, 20 per turn), not only on changed claims | user |

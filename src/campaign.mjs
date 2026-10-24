@@ -25,9 +25,9 @@ export function paths(dir) {
   };
 }
 
-function checkRole(name, rc, errors, {advisor = false} = {}) {
+function checkRole(name, rc, errors, {auditor = false} = {}) {
   if (!rc || typeof rc !== 'object') return errors.push(`${name} must be an object`);
-  const allowed = ['agent', 'model', 'bin', 'profile', 'effort', 'args', 'env', ...(advisor ? ['every_min'] : ['checkin'])];
+  const allowed = ['agent', 'model', 'bin', 'profile', 'effort', 'args', 'env', ...(auditor ? ['every_min'] : ['checkin'])];
   for (const k of Object.keys(rc)) if (!allowed.includes(k)) errors.push(`${name}.${k} is not a known field`);
   if (!AGENTS.includes(rc.agent)) errors.push(`${name}.agent must be one of ${AGENTS.join(', ')}`);
   if (typeof rc.model !== 'string' || !rc.model) errors.push(`${name}.model is required (exact model id)`);
@@ -41,12 +41,12 @@ function checkRole(name, rc, errors, {advisor = false} = {}) {
       else if (k === 'args' ? !Array.isArray(v) || v.some(a => typeof a !== 'string') : typeof v !== 'string') errors.push(`${name}.checkin.${k} has the wrong type`);
     }
   }
-  if (advisor && rc.every_min !== undefined && !(Number.isInteger(rc.every_min) && rc.every_min >= 1)) errors.push('advisor.every_min must be a positive integer');
+  if (auditor && rc.every_min !== undefined && !(Number.isInteger(rc.every_min) && rc.every_min >= 1)) errors.push(`${name}.every_min must be a positive integer`);
 }
 
 export function validateConfig(c) {
   const errors = [];
-  const known = ['id', 'repo', 'base_commit', 'gpu_cap', 'deadline', 'job_prefix', 'job_env', 'evaluator', 'worker', 'advisor', 'cadence', 'ledger_md', 'study_spool'];
+  const known = ['id', 'repo', 'base_commit', 'gpu_cap', 'deadline', 'job_prefix', 'job_env', 'evaluator', 'worker', 'auditor', 'advisor', 'cadence', 'ledger_md', 'study_spool'];
   for (const k of Object.keys(c)) if (!known.includes(k)) errors.push(`${k} is not a known field`);
   if (!ID_RE.test(c.id ?? '')) errors.push('id must match ' + ID_RE);
   if (typeof c.repo !== 'string' || !path.isAbsolute(c.repo)) errors.push('repo must be an absolute path');
@@ -61,7 +61,10 @@ export function validateConfig(c) {
     if (!Array.isArray(e?.paths) || !e.paths.length || e.paths.some(p => typeof p !== 'string' || path.isAbsolute(p) || p.split('/').includes('..'))) errors.push('evaluator.paths must be relative paths');
   }
   checkRole('worker', c.worker, errors);
-  if (c.advisor !== undefined && c.advisor !== null) checkRole('advisor', c.advisor, errors, {advisor: true});
+  // `advisor` is the auditor's old name, still accepted.
+  if (c.auditor !== undefined && c.advisor !== undefined) errors.push('set auditor or its old name advisor, not both');
+  const audKey = c.auditor !== undefined ? 'auditor' : 'advisor';
+  if (c[audKey] !== undefined && c[audKey] !== null) checkRole(audKey, c[audKey], errors, {auditor: true});
   if (c.cadence !== undefined) {
     for (const [k, v] of Object.entries(c.cadence)) {
       if (!['changed_min', 'idle_min', 'idle_max_min', 'busy_min'].includes(k)) errors.push(`cadence.${k} is not a known field`);
@@ -80,7 +83,8 @@ export function loadCampaign(dir) {
   const errors = validateConfig(config);
   if (errors.length) throw Error(`Invalid campaign.json:\n- ${errors.join('\n- ')}`);
   const cadence = {changed_min: 2, idle_min: 20, idle_max_min: 240, busy_min: 60, ...config.cadence};
-  return {dir, paths: p, config: {job_prefix: config.id, job_env: {}, advisor: null, ...config, cadence}};
+  const {advisor, ...rest} = config;
+  return {dir, paths: p, config: {job_prefix: config.id, job_env: {}, ...rest, auditor: config.auditor ?? advisor ?? null, cadence}};
 }
 
 export const registryLink = id => path.join(configDir(), 'campaigns', id);

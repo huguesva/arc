@@ -6,18 +6,19 @@ description: Coordinate an arc autonomous research campaign. Use when asked abou
 # Coordinating an arc campaign
 
 You are helping the human coordinator of a campaign run by arc (Autonomous Research Controller). A worker agent does
-the research, a deterministic controller runs jobs on Slurm, and an optional auditor checks claims. The human sets the
-goal and the verdict. You read evidence and act through `arc` commands only.
+the research, a deterministic controller runs jobs on Slurm, and an optional auditor checks claims and finished runs
+against the raw evidence, including signs of metric gaming. The human sets the goal and the verdict. You read
+evidence and act through `arc` commands only.
 
 ## Read in this order
 
-1. `arc status <id>`: phase, alerts, GPU budget, worker and advisor health, claims awaiting review. A dead controller,
+1. `arc status <id>`: phase, alerts, GPU budget, worker and auditor health, claims awaiting review. A dead controller,
    `role_failing`, `uncertain_submission` or `blocked` comes first.
 2. `arc claims <id>`: the conclusions with auditor verdicts and review state. This is the review queue.
 3. `<campaign>/findings.md`: the worker's current best answer.
 4. For a claim you check: the cited `artifacts/<request>/` (`provenance.json`, `execution.json`, `slurm-<job>.log`,
    outputs) and `state/requests/<request>.json`. Read the raw outputs before agreeing with any number.
-5. `turns/worker-latest.md` and `turns/advisor-latest.md` for the latest reports, `notes.md` for history, and
+5. `turns/worker-latest.md` and `turns/auditor-latest.md` for the latest reports, `notes.md` for history, and
    `events.jsonl` for exact transitions.
 
 ## Act only through arc
@@ -29,7 +30,7 @@ goal and the verdict. You read evidence and act through `arc` commands only.
 | Accept, reject or ask more of a claim | `arc review <id> C3 accept\|reject\|needs-more --hash <h> -m "note"` (h from `arc claims`; only when the human decides) |
 | Run something first | `arc priority <id> <request> <n>` |
 | Drop a queued request | `arc withdraw <id> <request> -m "reason"` |
-| Hold new submissions or turns | `arc pause <id> [submissions\|worker\|advisor]`, `arc resume ...` |
+| Hold new submissions or turns | `arc pause <id> [submissions\|worker\|auditor]`, `arc resume ...` |
 | Resolve an uncertain submission | `arc reconcile <id> <request> --adopt <job>` after checking `squeue`/`sacct`, or `--abandon` |
 | Pick up a new arc version | `arc restart <id>` (turns and jobs continue) |
 | End | `arc stop <id> -m "reason"` (jobs keep running) or `--cancel-jobs` |

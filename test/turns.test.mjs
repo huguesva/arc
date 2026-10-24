@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import {tick} from '../src/controller.mjs';
-import {isDue, loadTurns} from '../src/turns.mjs';
+import {isDue, loadTurns, auditorLatest, turnsFile} from '../src/turns.mjs';
+import {agentCommand} from '../src/agents.mjs';
+import {validateConfig} from '../src/campaign.mjs';
 import {parseClaims, parseVerdicts, claimStates} from '../src/claims.mjs';
 import {main} from '../src/cli.mjs';
 import {tempRepo, makeCampaign, context, status, request, writeRequest, record, STUB_AGENT} from './helpers.mjs';
@@ -130,14 +132,14 @@ test('claims parse with stable ids, hashes and a superseded section', () => {
     {C1: {verdict: 'supported', detail: 'matches metrics.json'}, C2: {verdict: 'unsupported', detail: 'only one seed'}});
 });
 
-test('advisor audits claims; human review binds to the claim text; an edit makes it stale', async () => {
+test('auditor audits claims; human review binds to the claim text; an edit makes it stale', async () => {
   const {repo, commit} = tempRepo();
-  const c = makeCampaign({repo, commit, config: {advisor: {agent: 'claude', model: 'stub-model', bin: (await import('./helpers.mjs')).STUB_AGENT, every_min: 30}}});
+  const c = makeCampaign({repo, commit, config: {auditor: {agent: 'claude', model: 'stub-model', bin: (await import('./helpers.mjs')).STUB_AGENT, every_min: 30}}});
   fs.writeFileSync(c.paths.findings, FINDINGS);
-  fs.writeFileSync(path.join(c.dir, 'stub-report-advisor'), 'C1: supported — matches metrics.json\nC2: unsupported — one seed only\nMaterial issues:\n- C2 rests on a single seed (lr-sweep/metrics.json)');
+  fs.writeFileSync(path.join(c.dir, 'stub-report-auditor'), 'C1: supported — matches metrics.json\nC2: unsupported — one seed only\nMaterial issues:\n- C2 rests on a single seed (lr-sweep/metrics.json)');
   const ctx = context(c);
   tick(ctx); ctx.now += 1000; tick(ctx);
-  const prompt = fs.readFileSync(path.join(c.paths.turns, 'advisor-0001.prompt.md'), 'utf8');
+  const prompt = fs.readFileSync(path.join(c.paths.turns, 'auditor-0001.prompt.md'), 'utf8');
   assert.ok(prompt.includes('## Claims to audit (2)'));
   let states = Object.fromEntries(claimStates(c).map(x => [x.id, x]));
   assert.equal(states.C1.state, 'audited');
@@ -145,7 +147,7 @@ test('advisor audits claims; human review binds to the claim text; an edit makes
   assert.equal(states.C2.audit.verdict, 'unsupported');
   assert.equal(status(c).claims.audited_unsupported, 1);
   ctx.now += 31 * MIN; tick(ctx);
-  assert.equal(loadTurns(c).advisor.n, 1, 'nothing new to audit: advisor does not run');
+  assert.equal(loadTurns(c).auditor.n, 1, 'nothing new to audit: auditor does not run');
 
   const log = console.log; console.log = () => {};
   try {
@@ -236,14 +238,14 @@ test('a systemctl hiccup does not end a running turn; only a definite inactive/f
   assert.equal(loadTurns(c).worker.consecutive_failures, 1, 'gone without an exit record counts as a failure');
 });
 
-test('advisor flag rate: a clean audit is not flagged', async () => {
+test('auditor flag rate: a clean audit is not flagged', async () => {
   const {repo, commit} = tempRepo();
-  const c = makeCampaign({repo, commit, config: {advisor: {agent: 'claude', model: 'stub-model', bin: (await import('./helpers.mjs')).STUB_AGENT}}});
+  const c = makeCampaign({repo, commit, config: {auditor: {agent: 'claude', model: 'stub-model', bin: (await import('./helpers.mjs')).STUB_AGENT}}});
   fs.writeFileSync(c.paths.findings, FINDINGS);
-  fs.writeFileSync(path.join(c.dir, 'stub-report-advisor'), 'C1: supported — fine\nC2: supported — fine\n\nMaterial issues: none');
+  fs.writeFileSync(path.join(c.dir, 'stub-report-auditor'), 'C1: supported — fine\nC2: supported — fine\n\nMaterial issues: none');
   const ctx = context(c);
   tick(ctx); ctx.now += 1000; tick(ctx);
-  assert.deepEqual(loadTurns(c).advisor.audits, {total: 1, flagged: 0});
+  assert.deepEqual(loadTurns(c).auditor.audits, {total: 1, flagged: 0});
 });
 
 test('a job starting to run is not news; a job finishing is', () => {
@@ -281,4 +283,80 @@ test('the hourly wake-up with nothing new is a short check-in, with its own chea
   assert.equal(t.totals.checkins, 1);
   const full = fs.readFileSync(path.join(c.paths.turns, `worker-${String(n).padStart(4, '0')}.prompt.md`), 'utf8');
   assert.ok(full.includes('## Request schema'), 'news turns stay full');
+});
+
+const AUDITOR = {agent: 'claude', model: 'stub-model', bin: STUB_AGENT, every_min: 60};
+const section = (prompt, title) => prompt.split(`## ${title}`)[1]?.split('\n## ')[0] ?? '';
+
+test('the auditor wakes on a completed run, sees its log, diff and previous report, and checks each run once', () => {
+  const {repo, commit} = tempRepo();
+  const c = makeCampaign({repo, commit, config: {auditor: AUDITOR}});
+  const ctx = context(c);
+  writeRequest(c, request(commit));
+  tick(ctx);
+  assert.equal(loadTurns(c).auditor.n, 0, 'a submitted run is not yet evidence');
+  ctx.slurm.set(record(c, 'r1').job_id, 'COMPLETED');
+  ctx.now += MIN; tick(ctx); ctx.now += 1000; tick(ctx);
+  assert.equal(loadTurns(c).auditor.n, 1, 'no claims, but a completed run wakes the auditor');
+  const first = fs.readFileSync(path.join(c.paths.turns, 'auditor-0001.prompt.md'), 'utf8');
+  const runs = section(first, 'Finished runs to check');
+  assert.match(runs, /^ \(1\)/);
+  assert.match(runs, new RegExp(`\`r1\` \\(training, 2 GPUs, seed 1\\): job ${record(c, 'r1').job_id} COMPLETED`));
+  assert.match(runs, /slurm-\d+\.log/);
+  assert.match(runs, /vs base: no change/);
+  assert.match(first, /## Your previous report[^\n]*\n\(none\)/);
+  assert.match(first, /- Base commit: [0-9a-f]{40}/);
+  assert.match(first, /Metric gaming/, 'the protocol covers metric gaming');
+  assert.deepEqual(loadTurns(c).auditor.checked_runs, ['r1']);
+
+  ctx.now += 61 * MIN; tick(ctx);
+  assert.equal(loadTurns(c).auditor.n, 1, 'a checked run is not sent again');
+
+  writeRequest(c, request(commit, {id: 'r2'}));
+  tick(ctx);
+  ctx.slurm.set(record(c, 'r2').job_id, 'COMPLETED');
+  ctx.now += MIN; tick(ctx); ctx.now += 1000; tick(ctx);
+  const second = fs.readFileSync(path.join(c.paths.turns, 'auditor-0002.prompt.md'), 'utf8');
+  assert.match(section(second, 'Finished runs to check'), /`r2`/);
+  assert.doesNotMatch(section(second, 'Finished runs to check'), /`r1`/);
+  assert.match(section(second, 'Your previous report'), /auditor turn done/);
+});
+
+test('the old advisor names keep working, and an old-name turn runs read-only', async () => {
+  const {repo, commit} = tempRepo();
+  assert.ok(validateConfig({id: 'x', repo, base_commit: commit, gpu_cap: 1, deadline: 'none', worker: AUDITOR, advisor: AUDITOR, auditor: AUDITOR})
+    .some(e => /not both/.test(e)));
+  const c = makeCampaign({repo, commit, config: {advisor: AUDITOR}});
+  assert.equal(c.config.auditor.model, 'stub-model');
+  assert.ok(!('advisor' in c.config));
+
+  fs.writeFileSync(turnsFile(c), JSON.stringify({advisor: {n: 5, audited_hashes: ['h']}}));
+  assert.equal(loadTurns(c).auditor.n, 5);
+  assert.ok(!('advisor' in loadTurns(c)));
+  fs.writeFileSync(path.join(c.paths.turns, 'advisor-latest.md'), 'old report');
+  assert.match(auditorLatest(c), /advisor-latest\.md$/);
+  fs.writeFileSync(path.join(c.paths.turns, 'auditor-latest.md'), 'new report');
+  assert.match(auditorLatest(c), /auditor-latest\.md$/);
+
+  fs.writeFileSync(c.paths.findings, FINDINGS);
+  fs.writeFileSync(path.join(c.paths.control, 'PAUSE_ADVISOR'), 'x\n');
+  const ctx = context(c);
+  tick(ctx);
+  assert.equal(loadTurns(c).auditor.n, 5, 'PAUSE_ADVISOR still pauses the auditor');
+  const log = console.log; console.log = () => {};
+  try { await main(['resume', c.dir, 'advisor']); } finally { console.log = log; }
+  assert.ok(!fs.existsSync(path.join(c.paths.control, 'PAUSE_ADVISOR')));
+  ctx.now += 61 * MIN; tick(ctx);
+  assert.equal(loadTurns(c).auditor.n, 6);
+
+  const opts = {worktree: '/w', campaignDir: '/c', reportFile: '/r', gitDir: '/g'};
+  for (const role of ['advisor', 'auditor']) {
+    const claude = agentCommand(role, {agent: 'claude', model: 'm'}, opts).args;
+    assert.equal(claude[claude.indexOf('--tools') + 1], 'Read,Glob,Grep,Bash');
+    assert.match(claude[claude.indexOf('--allowedTools') + 1], /Bash\(git show:\*\)/);
+    const codex = agentCommand(role, {agent: 'codex', model: 'm'}, opts).args;
+    assert.equal(codex[codex.indexOf('--sandbox') + 1], 'read-only');
+  }
+  const worker = agentCommand('worker', {agent: 'codex', model: 'm'}, opts).args;
+  assert.equal(worker[worker.indexOf('--sandbox') + 1], 'danger-full-access');
 });

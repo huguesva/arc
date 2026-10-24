@@ -16,7 +16,7 @@ import {systemctl, unitState} from './systemd.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ARC = path.join(HERE, '..', 'bin', 'arc');
-const PAUSES = {submissions: 'PAUSE_SUBMISSIONS', worker: 'PAUSE_WORKER', advisor: 'PAUSE_ADVISOR'};
+const PAUSES = {submissions: 'PAUSE_SUBMISSIONS', worker: 'PAUSE_WORKER', auditor: 'PAUSE_AUDITOR'};
 const VERDICTS = ['accept', 'reject', 'needs-more'];
 
 const HELP = `arc — Autonomous Research Controller
@@ -25,7 +25,7 @@ const HELP = `arc — Autonomous Research Controller
   arc start <campaign-dir> [--no-enable]   set up (dirs, worktree, unit) and start; idempotent
   arc status [<id>] [--json]                one campaign, or all
   arc steer <id> -m "text" | -f file [-t title]
-  arc pause|resume <id> [submissions|worker|advisor]
+  arc pause|resume <id> [submissions|worker|auditor]
   arc priority <id> <request> <n>
   arc withdraw <id> <request> -m "reason"
   arc claims <id>
@@ -86,7 +86,7 @@ async function start(ref, opt) {
   if (!fs.existsSync(paths.brief)) problems.push('brief.md is missing');
   if (!commitExists(config.repo, config.base_commit)) problems.push(`base_commit ${config.base_commit} not found in ${config.repo}`);
   if (config.evaluator && !commitExists(config.repo, config.evaluator.commit)) problems.push(`evaluator.commit ${config.evaluator.commit} not found`);
-  for (const role of ['worker', 'advisor']) {
+  for (const role of ['worker', 'auditor']) {
     const rc = config[role];
     if (rc && !which(rc.bin ?? rc.agent, site.path ?? process.env.PATH)) problems.push(`${role} agent binary ${rc.bin ?? rc.agent} not found on PATH`);
   }
@@ -221,10 +221,12 @@ export async function main(argv) {
     }
     case 'pause': case 'resume': {
       const c = campaign(pos[0]);
-      const which = pos[1] ? [need(PAUSES[pos[1]], 'submissions|worker|advisor')] : Object.values(PAUSES);
+      const name = pos[1] === 'advisor' ? 'auditor' : pos[1]; // the auditor's old name
+      const which = name ? [need(PAUSES[name], 'submissions|worker|auditor')] : Object.values(PAUSES);
       for (const f of which) {
         const p = path.join(c.paths.control, f);
         if (verb === 'pause') writeAtomic(p, `${isoNow()} ${opt.m ?? ''}\n`); else fs.rmSync(p, {force: true});
+        if (verb === 'resume' && f === 'PAUSE_AUDITOR') fs.rmSync(path.join(c.paths.control, 'PAUSE_ADVISOR'), {force: true});
       }
       console.log(`${verb}d ${which.join(', ')}`);
       return 0;

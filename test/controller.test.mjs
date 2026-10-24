@@ -293,7 +293,8 @@ test('status has the fixed schema', () => {
   tick(context(c));
   const s = status(c);
   for (const k of ['schema', 'campaign', 'generated_at', 'controller', 'deadline', 'budget', 'counts', 'queue', 'jobs', 'roles', 'claims', 'blocked', 'alerts']) assert.ok(k in s, k);
-  assert.equal(s.schema, 'arc.status/1');
+  assert.equal(s.schema, 'arc.status/2');
+  assert.deepEqual(Object.keys(s.roles), ['worker', 'auditor']);
   for (const k of ['pid', 'version', 'started_at', 'heartbeat_at', 'phase']) assert.ok(k in s.controller, k);
 });
 

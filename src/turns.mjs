@@ -12,9 +12,10 @@ import {git} from './git.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ARC_BIN = path.join(HERE, '..', 'bin', 'arc');
-export const ROLES = ['worker', 'advisor'];
+export const ROLES = ['worker', 'auditor'];
 const MIN = 60000;
 const FINDINGS_SOFT_LINES = 150;
+const RUNS_PER_AUDIT = 20;
 
 const emptyRole = () => ({n: 0, active: null, last_started_at: 0, last_finished_at: 0, last_ok_at: 0, consecutive_failures: 0,
   last_error: null, last_fingerprint: null, idle_streak: 0, totals: {turns: 0, failures: 0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, cost_usd: 0}, audits: {total: 0, flagged: 0}});
@@ -22,6 +23,8 @@ const emptyRole = () => ({n: 0, active: null, last_started_at: 0, last_finished_
 export const turnsFile = c => path.join(c.paths.state, 'turns.json');
 export function loadTurns(c) {
   const t = readJson(turnsFile(c), {});
+  if (t.advisor && !t.auditor) t.auditor = t.advisor; // the auditor's old name
+  delete t.advisor;
   for (const r of ROLES) t[r] = {...emptyRole(), ...t[r]};
   return t;
 }
@@ -30,6 +33,11 @@ export const turnName = (role, n) => `${role}-${String(n).padStart(4, '0')}`;
 export const unitName = (c, role, n) => `arc-${c.config.id}.${turnName(role, n)}`;
 export const unitGlob = id => `arc-${id}.*`;
 const fileHash = p => sha256(readText(p, ''));
+// The auditor's latest report. Campaigns started before the rename have it as advisor-latest.md.
+export function auditorLatest(c) {
+  const p = path.join(c.paths.turns, 'auditor-latest.md');
+  return fs.existsSync(p) ? p : path.join(c.paths.turns, 'advisor-latest.md');
+}
 
 // What counts as news for the worker: a request accepted (submitted), rejected, dropped, or a job finishing.
 // Progress in between (queued, held, released, PENDING -> RUNNING) is not news, so a long job costs few turns.
@@ -39,7 +47,7 @@ const newsOf = r => (r.status === 'finished' ? `finished:${r.slurm_state}` : NEW
 export function workerFingerprint(c, records) {
   const rows = records.map(r => [r.id, newsOf(r)]).filter(([, n]) => n).sort((a, b) => a[0].localeCompare(b[0]));
   return sha256(JSON.stringify([rows, fileHash(c.paths.brief), fileHash(c.paths.steering),
-    fileHash(path.join(c.paths.turns, 'advisor-latest.md')), fileHash(c.paths.reviews)]));
+    fileHash(auditorLatest(c)), fileHash(c.paths.reviews)]));
 }
 
 const backoffMs = failures => Math.min(60, 2 ** failures) * MIN;
@@ -66,19 +74,44 @@ function recentRejections(records, sinceMs) {
   return records.filter(r => r.status === 'rejected' && Date.parse(r.updated_at) > sinceMs).map(r => `- \`${r.id}\`: ${r.reason}`);
 }
 
+// Size of the code change behind a commit, against the campaign's base commit (memoised per call site).
+function diffStat(c, memo, commit) {
+  if (!memo.has(commit)) {
+    let stat;
+    try { stat = git(c.config.repo, ['diff', '--shortstat', c.config.base_commit, commit], {timeout: 30000}).trim() || 'no change'; } catch { stat = 'diff unavailable'; }
+    memo.set(commit, stat);
+  }
+  return memo.get(commit);
+}
+
 // For each request id cited by a claim: the controller's record and the code change behind it.
-function evidenceLines(c, claims, records) {
+function evidenceLines(c, claims, records, memo) {
   const ids = new Set(records.map(r => r.id));
   const cited = [...new Set(claims.flatMap(cl => cl.text.match(/[a-z][a-z0-9-]*/g) ?? []).filter(w => ids.has(w)))].slice(0, 30);
   return cited.map(id => {
     const r = records.find(x => x.id === id);
-    let stat = '';
-    try { stat = git(c.config.repo, ['diff', '--shortstat', c.config.base_commit, r.request.source_commit], {timeout: 30000}).trim(); } catch { stat = 'diff unavailable'; }
-    return `- \`${id}\`: ${r.status}${r.slurm_state ? ` ${r.slurm_state}` : ''}${r.exit_code ? ` exit ${r.exit_code}` : ''}, job ${r.job_id ?? '-'}, commit ${r.request?.source_commit ?? '-'} (vs base: ${stat || 'no change'}), evaluator ${r.evaluator_status ?? 'not pinned'}, artifacts ${path.join(c.paths.artifacts, id)}`;
+    return `- \`${id}\`: ${r.status}${r.slurm_state ? ` ${r.slurm_state}` : ''}${r.exit_code ? ` exit ${r.exit_code}` : ''}, job ${r.job_id ?? '-'}, commit ${r.request?.source_commit ?? '-'} (vs base: ${r.request ? diffStat(c, memo, r.request.source_commit) : '-'}), evaluator ${r.evaluator_status ?? 'not pinned'}, artifacts ${path.join(c.paths.artifacts, id)}`;
   });
 }
 
-export function digest(c, role, {status, records, claims, rs}) {
+// Completed runs the auditor has not checked yet, oldest first, a bounded batch per turn.
+export function runsToCheck(records, rs) {
+  const checked = new Set(rs.checked_runs ?? []);
+  return records.filter(r => r.status === 'finished' && r.slurm_state === 'COMPLETED' && !checked.has(r.id))
+    .sort((a, b) => (a.finished_at ?? '').localeCompare(b.finished_at ?? '') || a.id.localeCompare(b.id)).slice(0, RUNS_PER_AUDIT).map(r => r.id);
+}
+
+// For each run sent to the auditor: what it was for and where its evidence is.
+function runLines(c, runIds, records, memo) {
+  return runIds.map(id => {
+    const r = records.find(x => x.id === id);
+    const q = r.request;
+    const dir = path.join(c.paths.artifacts, id);
+    return `- \`${id}\` (${q.kind}, ${q.gpus} GPUs, seed ${q.seed}): job ${r.job_id} ${r.slurm_state}, ${r.elapsed_s ?? '?'} s, commit ${q.source_commit} (vs base: ${diffStat(c, memo, q.source_commit)}), evaluator ${r.evaluator_status ?? 'not pinned'}; log ${path.join(dir, `slurm-${r.job_id}.log`)}; artifacts ${dir}. Hypothesis: ${q.hypothesis.slice(0, 300)}`;
+  });
+}
+
+export function digest(c, role, {status, records, claims, rs, runIds = []}) {
   const out = [];
   const s = status;
   out.push(`## Live status (${s.generated_at})`,
@@ -98,20 +131,24 @@ export function digest(c, role, {status, records, claims, rs}) {
       (cl.audit ? ` audit: ${cl.audit.verdict}${cl.audit.detail ? ` (${cl.audit.detail})` : ''}` : '') +
       (cl.review ? ` human: ${cl.review.verdict}${cl.review.note ? ` (${cl.review.note})` : ''}` : '')));
     out.push(`## findings.md (${lines} lines${lines > FINDINGS_SOFT_LINES ? `; over ${FINDINGS_SOFT_LINES}: consolidate it this turn` : ''})`, findings || '(empty)');
-    const adv = readText(path.join(c.paths.turns, 'advisor-latest.md'), '').trim();
-    if (adv) out.push('## Latest advisor audit (nonbinding)', adv.slice(0, 12000));
+    const aud = readText(auditorLatest(c), '').trim();
+    if (aud) out.push('## Latest auditor report (nonbinding)', aud.slice(0, 12000));
   } else {
+    const memo = new Map();
     const toAudit = claims.filter(cl => !cl.superseded && !cl.audit);
     out.push(`## Claims to audit (${toAudit.length})`, toAudit.length ? toAudit.map(cl => cl.text).join('\n\n') : 'None changed since your last audit.');
-    const evidence = evidenceLines(c, toAudit, records);
+    const evidence = evidenceLines(c, toAudit, records, memo);
     if (evidence.length) out.push('## Evidence for the cited requests (controller records)', ...evidence);
+    out.push(`## Finished runs to check (${runIds.length})`, ...(runIds.length ? runLines(c, runIds, records, memo) : ['None finished since your last audit.']));
+    const previous = readText(auditorLatest(c), '').trim();
+    out.push('## Your previous report (do not repeat its points without new evidence)', previous ? previous.slice(0, 6000) : '(none)');
     out.push('## Full findings.md for context', findings || '(empty)');
   }
   out.push(`## Your health`, `Consecutive failures: ${rs.consecutive_failures}${rs.last_error ? `; last error: ${rs.last_error}` : ''}.`);
   return out.join('\n');
 }
 
-export function composePrompt(c, role, {site, status, records, claims, rs}) {
+export function composePrompt(c, role, {site, status, records, claims, rs, runIds}) {
   const {config, paths} = c;
   const protocol = readText(path.join(HERE, '..', 'prompts', `${role}.md`), '');
   const facts = [
@@ -121,9 +158,11 @@ export function composePrompt(c, role, {site, status, records, claims, rs}) {
     `- Requests directory: ${paths.requests}; withdrawals: ${paths.withdraw}`,
     `- GPU budget: ${config.gpu_cap} simultaneous GPUs (queued, held and running jobs all count)`,
     `- Deadline: ${config.deadline}`,
+    `- Base commit: ${config.base_commit}`,
     `- Evaluator: ${config.evaluator ? `pinned at ${config.evaluator.commit}, paths ${config.evaluator.paths.join(', ')}` : 'not pinned'}`,
     `- Previous turn reports: ${paths.turns}/${role}-NNNN.md`,
-    ...(role === 'worker' ? [`- Check a request before writing it: ${process.execPath} ${ARC_BIN} check-request <file> --campaign ${paths.dir}`] : []),
+    ...(role === 'worker' ? [`- Check a request before writing it: ${process.execPath} ${ARC_BIN} check-request <file> --campaign ${paths.dir}`]
+      : [`- Worker's lab notebook, where it answers your points: ${paths.notes}`]),
   ];
   return [
     protocol.trim(),
@@ -132,7 +171,7 @@ export function composePrompt(c, role, {site, status, records, claims, rs}) {
     facts.join('\n'),
     `## Brief\n\n${readText(paths.brief, '(missing brief.md)').trim()}`,
     `## Steering (chronological; later entries supersede earlier ones)\n\n${readText(paths.steering, '').trim() || '(none)'}`,
-    digest(c, role, {status, records, claims, rs}),
+    digest(c, role, {status, records, claims, rs, runIds}),
   ].filter(Boolean).join('\n\n') + '\n';
 }
 
@@ -153,7 +192,7 @@ export function composeCheckinPrompt(c, {status}) {
 }
 
 // Launch one turn as its own systemd unit so controller restarts never touch it.
-export function launch(c, role, {turns, now, site, systemd, prompt, fingerprint, claimHashes, log, persist, kind = 'full'}) {
+export function launch(c, role, {turns, now, site, systemd, prompt, fingerprint, claimHashes, runIds, log, persist, kind = 'full'}) {
   const rs = turns[role];
   const n = rs.n + 1;
   const name = turnName(role, n);
@@ -167,7 +206,7 @@ export function launch(c, role, {turns, now, site, systemd, prompt, fingerprint,
   // and never starts a second turn alongside a running one.
   rs.n = n;
   rs.last_started_at = now;
-  rs.active = {n, unit, started_at: now, fingerprint, claim_hashes: claimHashes, kind};
+  rs.active = {n, unit, started_at: now, fingerprint, claim_hashes: claimHashes, run_ids: runIds, kind};
   persist();
   try {
     systemd.start(unit, [process.execPath, ARC_BIN, 'turn', c.dir, role, String(n)], {cwd: c.paths.worktree, env});
@@ -203,7 +242,11 @@ export function harvest(c, role, {turns, now, systemd, log}) {
     rs.consecutive_failures = 0; rs.last_error = null; rs.last_ok_at = now; rs.last_fingerprint = a.fingerprint;
     const report = readText(path.join(c.paths.turns, `${name}.md`), '');
     writeAtomic(path.join(c.paths.turns, `${role}-latest.md`), report);
-    if (role === 'advisor') { recordAudit(c, rs, a, report, now); rs.audited_hashes = Object.values(a.claim_hashes ?? {}); }
+    if (role === 'auditor') {
+      recordAudit(c, rs, a, report, now);
+      rs.audited_hashes = Object.values(a.claim_hashes ?? {});
+      rs.checked_runs = [...new Set([...(rs.checked_runs ?? []), ...(a.run_ids ?? [])])];
+    }
   } else {
     rs.consecutive_failures += 1; rs.totals.failures += 1; rs.last_error = exit.error;
   }
@@ -216,7 +259,7 @@ function recordAudit(c, rs, active, report, now) {
   const verdicts = parseVerdicts(report);
   for (const [id, v] of Object.entries(verdicts)) {
     if (!active.claim_hashes?.[id]) continue; // only claims that existed when the audit started
-    state.audits[id] = {...v, hash: active.claim_hashes[id], turn: turnName('advisor', active.n), at: isoNow(now)};
+    state.audits[id] = {...v, hash: active.claim_hashes[id], turn: turnName('auditor', active.n), at: isoNow(now)};
   }
   rs.audits.total += 1;
   if (/material issues:\s*(?!none\b)\S/i.test(report) || Object.values(verdicts).some(v => v.verdict !== 'supported')) rs.audits.flagged += 1;
@@ -228,7 +271,8 @@ export const claimHashes = text => Object.fromEntries(parseClaims(text).map(cl =
 // --- The turn runner, executed inside the transient unit: `arc turn <campaign> <role> <n>` ---
 export async function runTurn(campaignDir, role, n) {
   const c = loadCampaign(campaignDir);
-  const roleConfig = c.config[role];
+  const key = role === 'advisor' ? 'auditor' : role; // a turn launched by a controller from before the rename
+  const roleConfig = c.config[key];
   if (!roleConfig) throw Error(`role ${role} is not configured`);
   // A check-in may run with a cheaper model or effort (worker.checkin in campaign.json).
   const rc = process.env.ARC_TURN_KIND === 'checkin' && roleConfig.checkin ? {...roleConfig, ...roleConfig.checkin} : roleConfig;
@@ -236,7 +280,7 @@ export async function runTurn(campaignDir, role, n) {
   const base = path.join(c.paths.turns, name);
   const reportFile = `${base}.md`;
   const prompt = fs.readFileSync(`${base}.prompt.md`, 'utf8');
-  const {bin, args} = agentCommand(role, rc, {worktree: c.paths.worktree, campaignDir: c.dir, reportFile, gitDir: path.join(c.config.repo, '.git')});
+  const {bin, args} = agentCommand(key, rc, {worktree: c.paths.worktree, campaignDir: c.dir, reportFile, gitDir: path.join(c.config.repo, '.git')});
   const started_at = isoNow();
   const out = fs.openSync(`${base}.jsonl`, 'a', 0o600);
   const err = fs.openSync(`${base}.stderr`, 'a', 0o600);

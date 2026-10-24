@@ -7,7 +7,7 @@ import {REQUEST_ID_RE, validateRequest, validateInRepo} from './request.mjs';
 import {TERMINAL, ENGINE_FLAGS, realSlurm} from './slurm.mjs';
 import {freeze, studyRecord, ARC_VERSION} from './freeze.mjs';
 import {deadlineMs, loadCampaign, loadSite, resolveCampaignDir, configDir} from './campaign.mjs';
-import {loadTurns, turnsFile, harvest, launch, isDue, composePrompt, composeCheckinPrompt, workerFingerprint, claimHashes} from './turns.mjs';
+import {loadTurns, turnsFile, harvest, launch, isDue, composePrompt, composeCheckinPrompt, workerFingerprint, claimHashes, runsToCheck} from './turns.mjs';
 import {claimStates} from './claims.mjs';
 import {buildStatus} from './status.mjs';
 import {realSystemd} from './systemd.mjs';
@@ -26,7 +26,7 @@ export function loadRecords(c) {
 
 function controlFlags(c) {
   const has = name => fs.existsSync(path.join(c.paths.control, name));
-  return {stop: has('STOP'), pauseSubmissions: has('PAUSE_SUBMISSIONS'), pauseWorker: has('PAUSE_WORKER'), pauseAdvisor: has('PAUSE_ADVISOR')};
+  return {stop: has('STOP'), pauseSubmissions: has('PAUSE_SUBMISSIONS'), pauseWorker: has('PAUSE_WORKER'), pauseAuditor: has('PAUSE_AUDITOR') || has('PAUSE_ADVISOR')};
 }
 
 function makeSave(ctx) {
@@ -305,7 +305,7 @@ function phaseOf(c, flags, now) {
   const dl = deadlineMs(c.config);
   if (flags.stop) return 'stopped';
   if (dl !== null && now >= dl) return 'deadline_closed';
-  if (flags.pauseSubmissions || flags.pauseWorker || flags.pauseAdvisor) return 'paused';
+  if (flags.pauseSubmissions || flags.pauseWorker || flags.pauseAuditor) return 'paused';
   return 'running';
 }
 
@@ -338,7 +338,7 @@ export function tick(ctx) {
   if (errors.length) obs.tickError = errors.join('; ');
 
   // Turns: harvest finished ones, then launch any that are due.
-  for (const role of ['worker', 'advisor']) harvest(c, role, {turns, now, systemd: ctx.systemd, log: ctx.log});
+  for (const role of ['worker', 'auditor']) harvest(c, role, {turns, now, systemd: ctx.systemd, log: ctx.log});
   const claims = claimStates(c);
   const dl = deadlineMs(c.config);
   const closed = dl !== null && now >= dl;
@@ -360,19 +360,21 @@ export function tick(ctx) {
     launch(c, 'worker', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: fp, log: ctx.log, persist, kind: checkin ? 'checkin' : 'full',
       prompt: checkin ? composeCheckinPrompt(c, {status}) : composePrompt(c, 'worker', {site: ctx.site, status, records, claims, rs: turns.worker})});
   }
-  if (c.config.advisor) {
-    // Claim texts the advisor already answered (successfully) are not re-sent, even if no verdict parsed.
-    const answered = new Set(turns.advisor.audited_hashes ?? []);
+  if (c.config.auditor) {
+    // Claim texts and completed runs the auditor already answered (successfully) are not re-sent, even if no verdict parsed.
+    const aud = turns.auditor;
+    const answered = new Set(aud.audited_hashes ?? []);
     const unaudited = claims.some(cl => !cl.superseded && !cl.audit && !cl.duplicate && !answered.has(cl.hash));
-    const a = isDue({rs: turns.advisor, now, every: {changed: c.config.advisor.every_min ?? 60}, changed: unaudited, activeJobs, closed: true, paused: flags.pauseAdvisor});
-    turns.advisor.next_due_at = a.next_due_at;
-    if (a.due) launch(c, 'advisor', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: null, log: ctx.log, persist,
-      claimHashes: claimHashes(readText(c.paths.findings, '')),
-      prompt: composePrompt(c, 'advisor', {site: ctx.site, status, records, claims, rs: turns.advisor})});
+    const runIds = runsToCheck(records, aud);
+    const a = isDue({rs: aud, now, every: {changed: c.config.auditor.every_min ?? 60}, changed: unaudited || runIds.length > 0, activeJobs, closed: true, paused: flags.pauseAuditor});
+    aud.next_due_at = a.next_due_at;
+    if (a.due) launch(c, 'auditor', {turns, now, site: ctx.site, systemd: ctx.systemd, fingerprint: null, log: ctx.log, persist,
+      claimHashes: claimHashes(readText(c.paths.findings, '')), runIds,
+      prompt: composePrompt(c, 'auditor', {site: ctx.site, status, records, claims, rs: aud, runIds})});
   }
   writeJson(turnsFile(c), turns);
 
-  const finished = closed && !activeJobs && !turns.worker.active && !turns.advisor.active && fp === turns.worker.last_fingerprint;
+  const finished = closed && !activeJobs && !turns.worker.active && !turns.auditor.active && fp === turns.worker.last_fingerprint;
   if (finished) phase = 'finished';
   const final = buildStatus({c, records, obs, turns, claims, now, phase, controller: ctx.controller});
   writeJson(c.paths.status, final);

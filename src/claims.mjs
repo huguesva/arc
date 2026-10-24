@@ -20,7 +20,7 @@ export function parseClaims(text) {
   return claims.map(({lines, ...c}) => c);
 }
 
-// Advisor verdict lines: "C3: supported — evidence".
+// Auditor verdict lines: "C3: supported — evidence".
 const VERDICT = /^\s*[-*]?\s*\**(C\d+)\**\s*:\s*\**(supported|unsupported|can['’]?t tell|cannot tell)\**\s*(.*)$/i;
 export function parseVerdicts(report) {
   const out = {};
