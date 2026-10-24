@@ -1,6 +1,6 @@
 ---
 name: arc-coordinator
-description: Coordinate an arc autonomous research campaign. Use when asked about a running campaign's status, results, claims or jobs, or to steer, pause, review, reconcile or stop it.
+description: Coordinate an arc autonomous research campaign. Use when asked to start one, about a running campaign's status, results, claims or jobs, or to steer, pause, cancel a job, review, reconcile or stop it.
 ---
 
 # Coordinating an arc campaign
@@ -8,7 +8,8 @@ description: Coordinate an arc autonomous research campaign. Use when asked abou
 You are helping the human coordinator of a campaign run by arc (Autonomous Research Controller). A worker agent does
 the research, a deterministic controller runs jobs on Slurm, and an optional auditor checks claims and finished runs
 against the raw evidence, including signs of metric gaming. The human sets the goal and the verdict. You read
-evidence and act through `arc` commands only.
+evidence and act through `arc` commands only. When you need the mechanics behind a command or an alert, read
+`docs/DESIGN.md` in the arc repository.
 
 ## Read in this order
 
@@ -25,7 +26,7 @@ evidence and act through `arc` commands only.
 
 | Want | Command |
 |---|---|
-| Start a campaign | `arc start <dir>`, once `~/.config/arc/site.mjs` exists (the user's cluster config; it lives only there). Where policy forbids agent sessions from leaving services running, prepare with `arc start <dir> --no-enable` and let the human run `arc start <dir>` |
+| Start a campaign | `arc init <id> --repo <path>`, then fill in `campaign.json` and `brief.md` with the human, then `arc start <id>`; needs `~/.config/arc/site.mjs` (the user's cluster config; it lives only there). Where policy forbids agent sessions from leaving services running, prepare with `arc start <id> --no-enable` and let the human run `arc start <id>` |
 | Change direction | `arc steer <id> -m "..."` (both roles read it next turn) |
 | Accept, reject or ask more of a claim | `arc review <id> C3 accept\|reject\|needs-more --hash <h> -m "note"` (h from `arc claims`; only when the human decides) |
 | Run something first | `arc priority <id> <request> <n>` |
@@ -46,9 +47,9 @@ evidence and act through `arc` commands only.
   checking `squeue`/`sacct`, and `arc withdraw` for a request that is superseded or clearly broken. Ask first before
   withdrawing a healthy running job (it is the worker's experiment: steer instead), changing the budget or deadline,
   `arc stop`, or `--cancel-jobs`.
-- Never edit `state/`, `status.json`, `events.jsonl`, request files, or the worker's files. Never run `sbatch`, `scancel`
-  or `scontrol` on campaign jobs: cancel through `arc withdraw`, so the record keeps the reason. The controller is the
-  only submitter.
+- Never edit `state/`, `status.json`, `events.jsonl`, request files, or the worker's files. Never run `sbatch`,
+  `scancel` or `scontrol` on campaign jobs: cancel through `arc withdraw`, so the record keeps the reason. The
+  controller is the only submitter.
 - `arc review` is the human's verdict. Run it only when the human has made that decision, and quote their note.
 - Report honestly: separate queued from running, exploratory (modified evaluator) from headline, audited from reviewed.
   Give job ids, request ids and file paths for every claim you relay.

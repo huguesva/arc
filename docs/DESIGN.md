@@ -1,154 +1,117 @@
 # arc design
 
-Status: **draft for approval** (2026-10-21). Nothing is implemented until this document is approved.
+arc (Autonomous Research Controller) runs autonomous research campaigns on a Slurm cluster. An AI **worker** does the
+research. A deterministic **controller** decides whether and how each experiment runs, and writes everything down. An
+optional AI **auditor** checks the work against raw evidence. The human **coordinator** sets the goal and gives the
+verdict. One engine serves every project; a campaign is a directory with no code in it.
 
-arc (Autonomous Research Controller) is a small, reusable harness for autonomous research campaigns on a Slurm
-cluster. One AI coding agent does the research. A deterministic controller owns scheduling, budgets and
-provenance. An optional second model audits claims and finished runs against raw evidence. A human sets the goal
-and the verdict.
+Everything below follows one split: **the AI decides what to try; plain code decides whether and how it runs.**
 
-It replaces per-project controllers that were copied and patched for each campaign. The semantics of
-those controllers are kept; their incidental complexity is not.
+Setting up and running a campaign: [quickstart.md](quickstart.md). Why each choice was made:
+[decisions.md](decisions.md).
 
 ## 1. Roles
 
-| Role | Kind | Responsibility | Runs |
+| Role | What it is | Does | Runs |
 |---|---|---|---|
-| Worker | LLM coding agent (Codex or Claude), full access to its worktree | Edits code, commits, writes immutable job requests, analyses results, maintains `findings.md` | One turn at a time, woken by the controller |
-| Auditor (optional) | LLM, read-only | Checks the claims in `findings.md` and completed runs against raw evidence, including metric gaming (§12) | On new claims or completed runs, at most every `auditor.every_min` |
-| Controller | Node, no LLM | Validates, budgets, freezes source, submits, reconciles, schedules turns, writes status | systemd user service, 30 s tick |
-| Coordinator | Human, optionally with an interactive agent session | Writes the brief, steers, reviews **claims** (§13) | Whenever they look |
+| **Worker** | Coding agent (Codex or Claude) with full access to its worktree | Edits and commits code, files and withdraws requests, reads results, keeps `findings.md` | One turn at a time, when the controller wakes it |
+| **Auditor** (optional) | Second model, read-only | Checks claims, code diffs and finished runs against raw evidence (§8) | On new claims or completed runs, at most every `auditor.every_min` |
+| **Controller** | Node process, no AI | Validates, budgets, freezes source, submits, cancels, reconciles, schedules turns, writes status | systemd user service, one tick every 30 s |
+| **Coordinator** | The human | Writes the brief, sets budget and deadline, steers, reviews claims, starts and stops | Whenever they look |
+| **Assistant** (optional) | Interactive agent session working for the coordinator, using `skills/arc-coordinator` | Reads everything; acts through `arc` commands within the authority the skill grants | Only while the coordinator is in the session |
 
-The worker never calls Slurm. The controller never decides what to run.
+Only the controller calls the scheduler. Agents act on a campaign through files: the worker through `requests/` and
+`withdraw/`, the auditor not at all. No agent touches the controller, arc's code or its systemd units.
 
 ## 2. Principles
 
-1. **A campaign is one directory**, on scratch by default. It holds the definition and all runtime state; the project tree
-   only gains a git worktree and a branch.
-2. **One writer per file.** Every file has exactly one owner (§3). Nobody edits another owner's file.
-3. **The controller holds no state in memory that matters.** Each tick re-reads small files. Agent turns run in their
-   own systemd units. Crash, restart and upgrade are the same safe operation.
-4. **Status is recomputed from state every tick.** Alerts are derived conditions, not stored strings; they clear
-   themselves.
-5. **Engine and site are separate.** All cluster policy (partitions, accounts, shared pools, fairness) lives in one local
-   `site.mjs` that is never committed. No constant appears in two places.
-6. **Everything done by hand before is a CLI verb.** No reload scripts, no state surgery.
-7. **Small.** Node ≥ 20, ESM, zero npm dependencies, `node:test`. Target ≈ 1,100 lines of source.
-8. **Code protects the record and the resources; prompts guide the rest.** A rule is enforced in code only if
-   breaking it would be irreversible, spend real resources, or corrupt the record: submission, budget, provenance,
-   immutable requests. How the agents think, write and talk to each other is set by their
-   prompts and left visible in `turns/` and `status.json`; drift is fixed by editing the prompt, not by adding
-   enforcement.
+1. **A campaign is one directory**, on scratch. It holds the definition and all runtime state; the project only gains a
+   git worktree and a branch.
+2. **One writer per file** (§3).
+3. **No state in memory that matters.** Each tick re-reads small files, and turns run in their own systemd units, so
+   crash, restart and upgrade are the same safe operation.
+4. **Status is recomputed every tick.** Alerts are derived conditions; they clear themselves.
+5. **Engine and site are separate.** Cluster policy lives only in a local `site.mjs` (§4) that is never committed.
+6. **Every manual operation is a CLI verb.** No reload scripts, no editing state by hand.
+7. **Small.** Node ≥ 20, ESM, no npm dependencies, `node:test`.
+8. **Code protects the record and the resources; prompts guide the rest.** Code enforces a rule only if breaking it
+   would be irreversible, spend real resources or corrupt the record: submission, budget, cancellation scope,
+   provenance, immutable requests. How agents think, write and talk is set in `prompts/` and stays visible in `turns/`;
+   drift is fixed by editing the prompt, not by adding enforcement. Agents run as the same Unix user, so the files they
+   must not write are protected by their prompts and by visibility (git, `events.jsonl`), not by permissions.
 
-   Limit: the worker runs as the same Unix user, so files it must not write (`control/`, `state/`, reviews) are
-   protected by its prompt and by being visible in git and `events.jsonl`, not by permissions.
-
-## 3. Where things live
+## 3. Files and owners
 
 ```
-~/arc/                                  this repo: code, prompts, templates, docs, tests
-~/.config/arc/site.mjs                  local cluster policy (not committed; template in templates/site.example.mjs)
-~/.config/arc/campaigns/<id>            symlink -> campaign directory (registry)
-~/.config/arc/locks/<id>.lock           single-instance lock
-~/.config/systemd/user/arc@.service     rendered by `arc start`
+~/.config/arc/site.mjs                cluster policy, local (template: templates/site.example.mjs)
+~/.config/arc/campaigns/<id>          registry: symlink to the campaign directory
+~/.config/arc/locks/<id>.lock         single-instance lock
+~/.config/systemd/user/arc@.service   rendered by arc start
 
-<runs_root>/<id>/                       one campaign (runs_root from site.mjs, on scratch)
-  campaign.json  brief.md  steering.md  human
-  control/  STOP  PAUSE_SUBMISSIONS  PAUSE_WORKER  PAUSE_AUDITOR  priority.json  reviews.jsonl
-            reconcile/<request>.json    human, via the CLI (reconcile commands are applied once, then renamed)
-  requests/<id>.json                    worker, create-only
-  withdraw/<id>                         worker or `arc withdraw`; content = reason
-  findings.md  notes.md  blocked.md     worker
-  worktree/                             worker; git worktree on branch arc/<id>
-  state/requests/<request>.json         controller: one record per request
-  state/turns.json                      controller: turn bookkeeping
-  state/claims.json                     controller: parsed claims, audit verdicts, review validity
-  state/notified.json                   controller: alerts already passed to site.notify (only if it exists)
-  artifacts/<request>/                  controller, then the job:
-      request.json provenance.json study.json source.tar run.sh
-      source/ (extracted by the job) slurm-<job>.log execution.json <expected outputs>
-  turns/<role>-NNNN.{prompt.md,jsonl,stderr,md,exit.json}   controller and turn runner
-  turns/<role>-latest.md
-  events.jsonl                          controller: every transition (the machine ledger)
-  status.json                           controller: fixed schema, rewritten every tick
+<runs_root>/<id>/                     one campaign
+  campaign.json brief.md steering.md  coordinator
+  control/                            coordinator, through the CLI: STOP, PAUSE_{SUBMISSIONS,WORKER,AUDITOR},
+                                      priority.json, reviews.jsonl, reconcile/<request>.json (applied once, renamed)
+  requests/<id>.json                  worker, create-only
+  withdraw/<id>                       worker or arc withdraw; the content is the reason
+  findings.md notes.md blocked.md     worker
+  worktree/                           worker: git worktree on branch arc/<id>
+  state/                              controller: requests/<id>.json (one record each), turns.json, claims.json,
+                                      notified.json
+  artifacts/<id>/                     controller (request.json provenance.json study.json source.tar run.sh), then the
+                                      job (source/ slurm-<job>.log execution.json and its outputs)
+  turns/<role>-NNNN.*, <role>-latest.md   controller and turn runner: prompt, transcript, report, exit record
+  events.jsonl                        controller: every transition
+  status.json                         controller: rewritten every tick
 ```
 
-## 4. Campaign definition
+## 4. Configuration
 
-`campaign.json`:
+**`campaign.json`** (template `templates/campaign.json`, validated by `src/campaign.mjs`):
 
-```json
-{
-  "id": "warmup-study",
-  "repo": "/path/to/project",
-  "base_commit": "<40 hex>",
-  "gpu_cap": 16,
-  "deadline": "2026-11-01T00:00:00Z",
-  "job_prefix": "ws",
-  "job_env": { "PYTHONPATH": "$ARC_SOURCE/src:$ARC_SOURCE" },
-  "evaluator": { "commit": "<40 hex>", "paths": ["eval/", "data/splits/test.txt"] },
-  "worker":  { "agent": "codex", "model": "<model id>", "profile": "<optional>", "effort": "high", "args": [] },
-  "auditor": { "agent": "claude", "model": "<model id>", "every_min": 60 },
-  "cadence": { "changed_min": 2, "idle_min": 20, "idle_max_min": 240, "busy_min": 60 },
-  "ledger_md": "/path/to/notebook/runs.md",
-  "study_spool": "/path/to/observer/spool"
-}
-```
+- Required: `id`, `repo`, `base_commit`, `gpu_cap` (simultaneous GPUs, pending and held jobs included), `worker`, and
+  `deadline`: an ISO time or the literal `"none"`, so it is always a conscious choice.
+- A role (`worker`, `auditor`) names an `agent` (`codex` or `claude`) and an exact `model`; a turn that reports a
+  different model fails. Optional: `bin` (a wrapper script), `profile`, `effort`, `args`, `env`; the worker's `checkin`
+  (cheaper settings for check-ins); the auditor's `every_min`. `advisor` is accepted as the auditor's old name.
+- Optional: `job_prefix`, `job_env` (exported in the job under `set -u`, so write `${VAR:-}` for unset variables),
+  `evaluator` (§6), `cadence` (§7), `ledger_md`, `study_spool`.
 
-- `deadline` is required: an ISO time or the literal `"none"`. That makes it a conscious choice, never a default.
-- `auditor`, `evaluator`, `ledger_md`, `study_spool`, `cadence`, `job_prefix` (defaults to `id`) and `job_env` are
-  optional. `advisor`, the auditor's old name, is still accepted in `campaign.json`, `state/turns.json`,
-  `PAUSE_ADVISOR` and `arc pause`.
-- The worker may set `checkin: {model?, effort?, args?}`: overrides used only for scheduled check-ins (§11).
-- Each role may set `bin` (absolute path of the agent CLI, e.g. a wrapper script), `profile`, `effort`, `args` and `env`.
-- `job_env` values are expanded in the job under `set -u`: write `${VAR:-}` for variables that may be unset.
-- Model ids must be exact. A turn whose reported model differs from the configured one fails (no silent substitution).
-- `brief.md`: objective, baseline, evaluation protocol, budget and deadline in prose. Stable.
-- `steering.md`: append-only dated entries, `## 2026-10-21T16:09Z — title`, written by `arc steer` or by hand. Read
-  in order; later entries supersede earlier ones. Both roles read the same text.
+**`brief.md`** states the question, baseline, evaluation, budget and priorities, as predictions and preferences rather
+than go/no-go gates (`templates/brief.md`). **`steering.md`** collects dated entries appended by `arc steer`; later
+entries supersede earlier ones. Both are read fresh by every turn.
 
-There is no separate project layer. Two campaigns on one project copy a few lines of `campaign.json`.
+**`site.mjs`** (local, `$ARC_SITE` or `~/.config/arc/site.mjs`):
+
+| Export | Purpose |
+|---|---|
+| `runs_root`, `path`, `prompt` | Where campaigns live; PATH for turns and jobs; cluster rules shown to both agents |
+| `route(request, {campaign, exec})` | sbatch arguments (partition, account, QoS, nodes, CPUs, memory, time, GRES) with a `note`, or `{wait: reason}`. May read live inventory for shared pools |
+| `validate(request)` | Throws for shapes the cluster can never run: the request is rejected |
+| `forbidden(request)` | Extra commands blocked inside jobs |
+| `notify(alert, {campaign, exec})` | Optional; see §10 |
+
+The engine owns `--hold`, `--parsable`, `--no-requeue`, `--job-name`, `--comment`, `--chdir` and `--output`, and
+rejects a route that sets them.
 
 ## 5. Requests
 
-A request is one file, `requests/<id>.json`. The file name must equal the `id`.
+A request is one file, `requests/<id>.json`, asking for one job: what to run (`source_commit`, `script`), on what
+(`gpus`, `cpus`, `mem_gb`, `minutes`, optional `partition`), why (`hypothesis`, `baseline`, `evaluation`,
+`data_provenance`, `config_description`, `seed`), what it produces (`expected_outputs`) and in what order (`after`,
+`priority`, `supersedes`), plus free-form `ext`. The exact rules live in the `FIELDS` table in `src/request.mjs`, which
+generates both the validator and the schema in the worker's prompt; `arc check-request` runs the same checks.
 
-| Field | Rule |
-|---|---|
-| `id` | `^[a-z][a-z0-9-]{0,63}$`, never reused |
-| `kind` | non-empty string, e.g. `training`, `evaluation`, `diagnostic` |
-| `source_commit` | 40 hex; must exist in `repo` (any branch or worktree) |
-| `script` | path relative to the commit root; a regular file in that commit (not a symlink); no `..` |
-| `gpus`, `cpus`, `mem_gb`, `minutes` | integers; `gpus ≥ 0`, the others ≥ 1 |
-| `partition` | optional; interpreted by the site module |
-| `seed` | integer |
-| `hypothesis`, `baseline`, `evaluation`, `data_provenance`, `config_description` | non-empty strings |
-| `expected_outputs` | non-empty array of relative paths |
-| `after` | optional array of request ids that must finish `COMPLETED` first |
-| `priority` | optional integer, default 0 |
-| `supersedes` | optional request id (lineage only, no effect on scheduling) |
-| `ext` | optional free-form object for project fields; recorded, not interpreted |
+- The file name is the id; ids are never reused; unknown fields are rejected.
+- The script must be a regular file committed in `source_commit`, and may not mention `sbatch`, `salloc`, `scancel`,
+  `scontrol` or the site's `forbidden` names.
+- **Immutable.** On first sight the controller snapshots the request and its hash. Later edits are ignored and raise
+  `request_mutated`; a retry or change is a new id.
 
-- Unknown top-level fields are rejected. This catches typos and keeps the schema honest.
-- `site.validate(request)` may reject shapes the cluster can't run.
-- The static scan rejects scripts that mention `sbatch`, `salloc`, `scancel` or `scontrol`, plus any extra names from
-  `site.forbidden(request)`.
-- **Validation lives in one `FIELDS` table.** The validator and the request section of the worker prompt are
-  both generated from it, so the documentation can't drift.
-- **The worker checks before writing.** `arc check-request <file>` runs the same validation (minus commit lookup if run
-  outside the campaign), so the worker can check before dropping a file.
-- **Requests are immutable.** On first sight the controller copies the request and its sha256 into `state/<id>.json`.
-  Later edits to the file are ignored and raise `request_mutated`. A deleted file has no effect.
-- **Withdrawal.** The worker or `arc withdraw` creates `withdraw/<id>` with a reason. A `queued` request is dropped. A
-  `submitted` one, pending or running, is cancelled by the controller (§9) and finishes `CANCELLED` with the reason
-  recorded; requests that depend on it are then dropped (`dependency_failed`). A `submitting` or `uncertain` request
-  raises `withdraw_uncertain` and waits for `arc reconcile`. When to stop a running job is a prompt rule: superseded
-  or clearly broken, never to hide a result; a stopped run counts in "Variants tried".
-
-## 6. Request lifecycle
+**Lifecycle.**
 
 ```
-queued ──submit──▶ submitting ──receipt──▶ submitted ──terminal state──▶ finished
+queued ──admit──▶ submitting ──receipt──▶ submitted ──terminal state──▶ finished
   │  ▲                 │                   (held → released)
   │  └ transient error,│ crash or ambiguous sbatch
   │    retry later,    ▼
@@ -158,484 +121,240 @@ queued ──submit──▶ submitting ──receipt──▶ submitted ──t
   └─ withdrawn, dependency failed, abandoned ──▶ dropped
 ```
 
-Error classes:
+A submitted request that is withdrawn has its job cancelled and finishes `CANCELLED` (see Withdrawal).
 
-- **Permanent**: any validation failure. The request becomes `rejected` and its id is spent. The worker sees the
-  error in its next digest and files a new id.
-- **Transient**: git or tar failure or timeout, `scontrol release` failure, or a definite `sbatch` error (non-zero
-  exit with an `sbatch: error` message that is not a socket, timeout or connection error). The request stays in its
-  state with `retry_at = now + min(60, 2^attempts)` minutes. It never gives up, and `last_error` is shown in status.
-- **Ambiguous**: `sbatch` timed out, was killed, or the controller crashed while `submitting`. Recovery decides (§9).
+**Errors.**
 
-## 7. Admission
-
-Each tick, unless STOP, PAUSE_SUBMISSIONS or the deadline applies:
-
-1. Sort `queued` records by (effective priority desc, first seen asc, id). Effective priority is
-   `control/priority.json[id]` if set (`arc priority`), otherwise the request's `priority`.
-2. For each request:
-   - **Retry not due**: skip; `waiting_for: retry`.
-   - **Dependencies**: if an `after` request finished other than `COMPLETED`, or was rejected or dropped, this
-     request is dropped (`dependency_failed`). If a dependency is not finished yet, or is unknown: `waiting_for:
-     dependency`.
-   - **Budget**: `reserved + gpus > gpu_cap` → `waiting_for: budget`. This blocks every later request with a
-     **lower** priority (`waiting_for: priority`). Requests at the same priority may still backfill.
-   - **Site route**: `site.route(request, ctx)` returns sbatch arguments or `{wait: reason}`. A wait behaves like a
-     budget block.
-   - Otherwise submit (§8).
-
-`reserved` is the sum of `gpus` over records that are `submitting`, `uncertain`, or `submitted` and not yet terminal,
-plus the GPUs of orphan jobs (§9). Pending and held jobs count. Shared cluster pools (for example a per-user
-ceiling across all campaigns) are the site module's job, using live `squeue` inventory.
-
-## 8. Submission
-
-In order. Each step is idempotent, so a crash at any point is repaired by the next tick.
-
-1. **Freeze** into `artifacts/<id>/`:
-   - Write `source.tar` with `git -C <repo> archive <commit>`, and compute the sha256 of the archive and of the script
-     (read with `git show`).
-   - Record the campaign worktree's uncommitted changes as `ignored_worktree_changes`.
-   - Check the evaluator (§10).
-   - Write `request.json`, `provenance.json` and `run.sh`.
-   - If the artifact already holds a matching `provenance.json`, reuse it.
-   - git calls get a 30-minute timeout; a timeout is transient.
-2. **Record intent**: status `submitting`, with `intent_at`.
-3. **Submit held**: `sbatch --parsable --hold --no-requeue --job-name=<prefix>-<id> --comment=arc:<campaign>:<id>
-   --chdir=<artifact> --output=<artifact>/slurm-%j.log <site args> run.sh`. The request id is the exact token: a
-   request is submitted at most once.
-4. **Record receipt**: status `submitted`, `job_id`, `released: false`.
-5. **Record the study**: write `study.json` with the job id, and copy it atomically into `study_spool` if one is set
-   (the copy is checked separately, so a crash between the two writes cannot skip it). Write a ledger line (§13).
-   Adopted jobs (§9) go through this same step; one already terminal is then finished at once.
-6. **Release**: `scontrol release <job>`, then `released: true`.
-
-`study.json` uses the field names existing observers read: `id`, `title`, `hypothesis`, `source_commit`,
-`submitted_after`, `jobs[{id, purpose}]`, `evidence_paths`, `baseline`, `evaluation`, `seed`, `data_provenance`,
-`campaign`, `evaluator_status`. An observer ingests the spool in its own cycle. arc never submits helper jobs.
-
-`run.sh`, generated:
-
-- exports `ARC_CAMPAIGN`, `ARC_REQUEST_ID`, `ARC_RUN_DIR`, `ARC_SOURCE`, `ARC_SEED`;
-- sets `OMP/MKL/OPENBLAS_NUM_THREADS` from `$SLURM_CPUS_PER_TASK`;
-- adds the `job_env` entries (expanded at run time);
-- puts PATH shims first, so `sbatch`, `salloc`, `scancel`, `scontrol` and the site's extra names fail loudly;
-- extracts `source.tar` into `source/` on the compute node if not already present;
-- runs `bash <script>` from `source/`;
-- writes `execution.json` (exit code, job id, start and end times) from an EXIT trap.
-
-Extracting on the compute node keeps the slow filesystem work out of the controller's tick.
-
-## 9. Reconciliation
-
-Each tick:
-
-- **Observe.** Run `sacct -X -n -P -j <non-terminal job ids> --format=JobIDRaw,State,ExitCode,ElapsedRaw`. A
-  terminal state (`COMPLETED FAILED CANCELLED TIMEOUT OUT_OF_MEMORY NODE_FAIL BOOT_FAIL DEADLINE PREEMPTED REVOKED`)
-  makes the record `finished` and writes a ledger line. A job missing from `sacct` keeps its last state.
-- **Adopt.** For each `submitting` or `uncertain` record, search `squeue --me` for the exact comment
-  `arc:<campaign>:<id>`, then `sacct --name=<prefix>-<id>` since `intent_at`.
-  - Exactly one match: adopt it as `submitted` (released or not, as Slurm reports).
-  - Otherwise `submitting` becomes `uncertain`; it is re-checked every tick.
-  - An uncertain request keeps its GPUs reserved and blocks only itself. It is never resubmitted.
-  - A human resolves it with `arc reconcile <id> --adopt <job>` or `--abandon` (which makes it `dropped`). The command
-    is written to `control/reconcile/` and applied by the controller on its next tick, so `state/` keeps one writer.
-- **Release.** `submitted` and not released: write the study if missing, then release.
-- **Cancel withdrawn.** A `submitted` record with a `withdraw/<id>` file is cancelled with `scancel`, only if `squeue`
-  shows its job id under the exact comment `arc:<campaign>:<id>`; otherwise `observe` finishes it. The record keeps
-  `withdrawn` (the reason), is not released, and a failed `scancel` is retried after 5 minutes. The event, the ledger
-  line and the worker's digest carry the reason. Requires a fresh queue view, like admission.
-- **Orphans.** Jobs in `squeue --me` whose comment starts with `arc:<campaign>:` but match no record's job id
-  count toward `reserved` (GPUs parsed from `%b × %D`) and raise `orphan_job`.
-
-## 10. Pinned evaluator
-
-Problem: provenance guarantees *what* ran, not that the measurement was fair. The worker writes both the method
-and, by default, the code that scores it.
-
-- `campaign.json` `evaluator` pins a commit and a list of paths (evaluation code, test split definitions). The
-  human vets them once.
-- At freeze time the controller runs `git diff --quiet <pinned> <source_commit> -- <paths>`. It records
-  `evaluator: {commit, status: unmodified|modified, tree ids}` in `provenance.json`, `study.json` and the ledger.
-- The worker protocol: headline claims in `findings.md` cite runs with an unmodified evaluator. Runs with a modified
-  evaluator are labelled exploratory. Changing the evaluator is a human decision: re-pin with a steering note.
-- This is a label, not a gate: nothing is blocked. It detects rather than prevents, because the worker runs as the
-  same Unix user.
-
-## 11. Agent turns
-
-**Execution.**
-
-- The controller writes `turns/<role>-NNNN.prompt.md`, then launches
-  `systemd-run --user --collect --unit=arc-<campaign>.<role>-NNNN … arc turn <campaign> <role> NNNN`. Ids cannot
-  contain `.`, so `arc-<campaign>.*` matches only this campaign's turns. The turn is saved before `systemd-run`, so a
-  crash in between can never start a second turn beside a running one. Only `inactive` or `failed` from systemctl
-  counts as gone; an error or timeout counts as still running.
-- `arc turn` runs the agent CLI with the prompt on stdin and captures `.jsonl` and `.stderr`. It parses the
-  transcript and writes `.md` (the report) and `.exit.json` (`{ok, model, usage, error, started_at, finished_at}`).
-- Turns are not children of the controller. Restarting or upgrading the controller never touches a turn.
-- Each tick: if `exit.json` exists, the turn is harvested. If the unit is gone without an `exit.json`, the turn
-  failed.
-
-**Adapters** (`src/agents.mjs`). Each turns role config into argv and env, and parses the transcript into
-`{ok, report, model, usage, error}`.
-
-- `codex`: `codex exec --json --output-last-message`. The worker gets `--sandbox danger-full-access --cd <worktree>
-  --add-dir <campaign>`; the auditor gets `--sandbox read-only`.
-- `claude`: `claude --print --output-format stream-json --verbose --no-session-persistence`. The auditor's tools are
-  limited to `Read,Glob,Grep` plus read-only `git show`, `git diff` and `git log`.
-- Every role other than the worker is read-only.
-- The same credentials home is used for both roles unless a role sets `env`, so a separate home can't silently run
-  out of credits.
-
-**Cadence.**
-
-- Worker fingerprint = hash of the news state of every request (accepted, rejected, dropped, or finished with its
-  final Slurm state), `brief.md`, `steering.md`, the latest auditor report and the human reviews. Progress in between
-  (queued, held, released, PENDING → RUNNING) is not news, so a long job costs about two turns plus the `busy_min`
-  check-ins.
-- **Worker** is due when no worker turn is active, PAUSE_WORKER is absent, and at least one holds:
-  - the fingerprint changed since the last turn started, and `changed_min` has passed;
-  - no job is active and the idle interval has passed;
-  - `busy_min` has passed.
-- Failure backoff: `min(60, 2^consecutive_failures)` minutes after the failed turn. Never permanent. No turn timeouts
-  and no turn caps.
-- **Idle backoff.** The idle interval is `idle_min`, doubled after each turn that only the idle timer woke (no job
-  active, fingerprint unchanged, no failure to retry), up to `idle_max_min` (default 240). Any other turn resets it.
-  A worker waiting on the human otherwise costs a full turn every `idle_min` for as long as nobody looks; steering is
-  news, so it still gets an answer within `changed_min`. `status.json` shows the streak.
-- After the deadline only the first condition applies.
-- **Check-in turns.** When the worker is due only because `busy_min` passed (jobs running, fingerprint unchanged, no
-  failure to retry), it gets a short check-in prompt (`prompts/worker-checkin.md`): the running jobs with their log
-  paths, the budget and queue, and the paths of brief, findings and notes. It checks job health and ends in a few tool
-  calls; only if something is broken does it read the brief and findings and act. `worker.checkin` can make these
-  turns cheaper (lower effort or another model). A turn costs mostly the agent's tool loop, not the prompt, so the
-  saving comes from the short task; nothing is capped.
-- **Auditor** is due when configured, no auditor turn is active, PAUSE_AUDITOR is absent, `every_min` has passed since
-  its last start, and there is something it has not answered in a successful turn: a live claim without a valid audit,
-  or a completed run it has not checked. Answered claim texts and checked runs are not re-sent, so something it cannot
-  parse is not sent forever. Runs go oldest first, at most 20 per turn. Its prompt lists each cited request's and each
-  run's record, commit, diff size against the base commit and log path, and its own previous report. The auditor runs
-  independently of the worker.
-
-**Prompt**, composed fresh every turn and archived:
-
-1. `prompts/<role>.md` from this repo (the role protocol). The worker's version includes the request schema
-   generated from `FIELDS`.
-2. `site.prompt`: cluster rules text.
-3. Campaign facts: id, GPU cap, deadline, paths, evaluator pin.
-4. `brief.md`.
-5. `steering.md`, introduced by "chronological; later entries supersede earlier ones".
-6. A digest:
-   - phase and budget;
-   - the queue with `waiting_for`;
-   - active and recently finished jobs;
-   - requests rejected since this role's last turn, with errors;
-   - alerts and this role's own health;
-   - `findings.md` with its line count, plus a consolidation nudge above 150 lines;
-   - `blocked.md`;
-   - for the worker, the audit and human review state of each claim, with notes; for the auditor, the claims that
-     changed, the completed runs to check, their evidence paths and its own previous report.
-
-**Worker files.**
-
-- `findings.md`: the current best answer, rewritten each turn rather than appended to. It has sections for the
-  question, the current answer with its confidence, the claims (§13), open questions and next steps, and superseded
-  claims (one line each).
-- `notes.md`: an append-only lab notebook.
-- `blocked.md`: written when a task looks impossible, contradictory or mis-specified. It is shown at the top of
-  status and to the auditor, and does not stop anything.
-- When a procedure, gate or success criterion in the brief can't be carried out or can't discriminate, the worker
-  protocol says not to wait: write `blocked.md`, adopt the most defensible feasible substitute, label what depends on
-  it exploratory, and carry on. The pinned evaluator code, claim reviews and the controller's files are excluded. This
-  is a prompt rule (principle 8); the brief template asks for priorities and predictions rather than go/no-go gates.
-
-## 12. Auditor protocol
-
-The auditor checks the work against raw evidence; it doesn't plan research. It was called the advisor until decision
-26: the old name invited idea generation, and every idea costs the worker a turn.
-
-- **Input**: the claims in `findings.md` that are new or changed since its last audit, the completed runs it has not
-  checked, their evidence paths, the diffs of the commits behind them, the request records and logs, and its own
-  previous report. It never reads the worker's turn report; it may read `notes.md` only for the worker's answers to
-  its points.
-- **Three checks**, each grounded in a file, job id, log line or number:
-  1. *Claims*: does each claim follow from the artifacts (checklist below)?
-  2. *Metric gaming*: does a code diff move the metric without improving the method? Scoring, filtering or
-     post-processing changed (inside or outside the pinned paths), outputs dropped or selected before scoring, a
-     denominator without failures, a changed panel, seed, sample count or reference set, copied or hard-coded answers,
-     disabled limits or checks, a test panel reused for selection.
-  3. *Finished runs*: does a log or output make a result unreliable or waste budget? NaN, loss or gradient-norm
-     spikes, late validation-loss rise, restart or OOM loops, code imported from outside `$ARC_SOURCE`, wrong
-     checkpoint or data, missing outputs. Running jobs stay with the worker's check-ins, since the worker is the one who
-     can act.
-- **Per claim**, a fixed checklist answered yes / no / can't tell:
-  - Does the number match the artifact?
-  - Do the baseline and the arm use the same protocol and denominator?
-  - Are there enough seeds for the claimed effect size?
-  - Is the evaluator unmodified?
-  - Is any failed or discarded run left out?
-  - Could test data leak into training?
-- **Output**, fixed shape:
-  - one line per claim, `C<n>: supported | unsupported | can't tell — <evidence>`, which the controller parses into
-    `state/claims.json`;
-  - then `Material issues: none` or a list where every item cites a file, job id or number;
-  - then at most one `Suggestion:` line, only as the fix for an issue it cited. Never a new direction, ablation or
-    experiment that is not a fix.
-  - Only issues that would change a conclusion or the next decision count. No style notes.
-- **No repeats**: it does not raise a point from its previous report again without new evidence; a point the worker
-  answered in `notes.md` is closed unless the evidence changed.
-- **Framing in the prompt**: "Most audits find no material issues; saying so is a correct and complete result."
-- The worker sees the per-claim verdicts in its digest and the auditor's latest report, labelled nonbinding
-  (principle 8: the report shape is a prompt rule, not filtered in code). It acts on an issue or the suggestion when
-  that would change the current answer or its next decision, and otherwise declines in one line in `notes.md`.
-- `status.json` shows the auditor's flag rate. Near 100% means it is nagging; near 0% over many audits may mean it is
-  rubber-stamping. Either is a prompt problem to fix.
-
-## 13. Claims, review, ledger, status
-
-**Human review is per claim, not per job.** A job finishing says nothing about whether a conclusion is true, and a
-per-job review queue does not scale. One legacy notebook reached 15,000+ unticked "Needs analysis" job lines.
-
-- **Claims.** In `findings.md`, each claim is a block with a stable id:
-
-  ```
-  ### C3 — 2k warmup lowers final val loss by 0.03 ± 0.01 vs 500 steps
-  Evidence: warmup-2k-seed1..3 vs warmup-500-seed1..3; artifacts/<id>/metrics.json
-  Evaluator: unmodified
-  Variants tried: 4
-  ```
-
-  - Ids are never reused.
-  - A retracted claim moves to the superseded section with its id.
-- **Parsing.** Each tick the controller parses the claim blocks into `state/claims.json`, with the sha256 of each
-  block's text.
-- **Audit.** The auditor's verdict lines (§12) attach to a claim together with the hash they were made against.
-- **Review.** `arc review <campaign> C3 accept|reject|needs-more --hash <h> -m "note"` appends
-  `{claim, verdict, note, at, hash}` to `control/reviews.jsonl`.
-  - `<h>` is the hash prefix shown by `arc claims`; if the claim changed since, the review is refused, so a verdict
-    never binds to text the human did not read.
-  - Only a human writes that file (by convention and prompt; see principle 8).
-  - A review counts only while the claim's hash still matches. If the worker edits the claim, it becomes `stale` and
-    needs a new review.
-  - The worker sees audit and review verdicts per claim in its digest.
-- **Claim states**, derived each tick:
-  - `new` (not audited yet), `audited`, `reviewed:accept`, `reviewed:reject`, `reviewed:needs-more`, `stale`;
-  - `superseded`, for a claim moved to the superseded section.
-- **Job ledger = provenance only.** `events.jsonl` records every transition
-  `{at, type, request?, job?, from?, to?, detail}`. If `ledger_md` is set, a plain line (no checkbox, no review
-  expectation) is appended under `flock` on submission (with the job id) and on finish. Point it at a file only arc
-  writes: a notebook rewritten by other tools under another lock can lose appended lines.
-- `status.json` (`schema: "arc.status/2"`; `/2` renamed `roles.advisor` to `roles.auditor`) has every key present on
-  every tick:
-  - `controller {pid, version, started_at, heartbeat_at, phase}`, where phase is one of `running`, `paused`,
-    `deadline_closed`, `stopped`, `finished`;
-  - `deadline {at, remaining_s, closed}`;
-  - `budget {cap, reserved, free, orphan_gpus}`;
-  - `counts` by status, and `queue [{id, priority, waiting_for}]`;
-  - `jobs {active, recent}`;
-  - `roles.{worker,auditor} {active, last_started, last_finished, next_due_at, idle_streak, consecutive_failures,
-    last_error, health}`;
-  - `blocked`;
-  - `claims {total, awaiting_review, stale, audited_unsupported, accepted, rejected}`;
-  - `alerts [{code, message, ids}]`.
-- Alert codes, all derived each tick:
-  - `uncertain_submission`, `orphan_job`, `request_mutated`, `withdraw_uncertain`;
-  - `role_failing` (3 or more consecutive failures, with the provider's message), `controller_error` (last tick
-    threw);
-  - `evaluator_modified`, `findings_long`, `blocked`.
-- Notifications are opt-in. If `site.notify` exists, the controller calls it once when an alert first appears (keyed by
-  code and ids, kept in `state/notified.json`), and again only after the alert clears and returns. Errors are logged as
-  `notify_error` and never stop a tick. Without the hook nothing is sent.
-- `arc status` reports the controller as dead if the heartbeat is older than 3 minutes or the unit is inactive.
-
-## 14. Process model
-
-- **Unit.** `arc@.service` is rendered by `arc start` with absolute node and arc paths:
-  - `ExecStart=/usr/bin/flock --no-fork --nonblock %h/.config/arc/locks/%i.lock <node> <arc>/bin/arc run %i`;
-  - `Restart=on-failure`, `RestartSec=30`, `UMask=0077`, `KillMode=mixed`, `TimeoutStopSec=300`: SIGTERM reaches only
-    the controller, which finishes the step in progress (an sbatch is never killed mid-flight) and stops admitting
-    once STOP is written.
-  - `arc run` refuses to start unless it holds the campaign lock, so a manual run cannot become a second controller
-    on this node. The lock is node-local in effect: run each campaign's controller on one node only.
-  - Node is the MainPID, and only short-lived children inherit the lock fd.
-- **Loop.** The tick loop is sequential (no overlap). SIGTERM finishes the current step, then exits 0.
-- **End of campaign.** After the deadline, once no job is active, no turn is active and the last worker turn started
-  after the last evidence change, phase becomes `finished` and the controller exits 0.
-- **Stop.** `arc stop`:
-  1. writes `control/STOP` with a reason;
-  2. stops the unit and the `arc-<id>.*` turn units;
-  3. with `--cancel-jobs`, runs `scancel` on every campaign job;
-  4. verifies that no unit is active and the lock is free, then reports what is still in Slurm.
-- **Preserved jobs.** Without `--cancel-jobs`, running and queued jobs are kept.
-- **Restart.** `arc restart` restarts the controller only; turns and jobs continue.
-
-## 15. CLI
-
-```
-arc init <id> --repo <path>   new campaign directory from templates (in runs_root), base_commit = repo HEAD
-arc start <dir|id>            validate config, files, site, agent binaries and scheduler access; create dirs and
-                              worktree (git worktree add <dir>/worktree -b arc/<id> <base_commit>); register;
-                              install the unit; clear STOP; enable; wait for a heartbeat; print a summary.
-                              Idempotent.
-arc status [<id>] [--json]    one campaign, or all with GPU totals
-arc steer <id> -m "…" | -f <file>
-arc pause|resume <id> [submissions|worker|auditor]   (default: all three)
-arc priority <id> <request> <n>
-arc withdraw <id> <request> -m "reason"   queued: dropped; submitted (pending or running): cancelled
-arc claims <id>               claims with audit and review state, awaiting-review first
-arc review <id> <claim> accept|reject|needs-more -m "note"
-arc reconcile <id> <request> --adopt <job> | --abandon
-arc restart <id>
-arc stop <id> [--cancel-jobs] -m "reason"
-arc archive <id>              after stop: remove the worktree (git worktree remove), unit and registry link
-arc check-request <file>      for the worker
-arc run <id> | arc turn <id> <role> <n>              internal entry points
-```
-
-## 16. Site module
-
-`~/.config/arc/site.mjs`, local only. The repo ships `templates/site.example.mjs` with a generic single-partition
-policy.
-
-```
-export const runs_root                          default parent for new campaigns (scratch)
-export const path                               PATH for turns and jobs
-export const prompt                             cluster-rules text for both roles
-export function validate(request)               throw for shapes the cluster can't run (permanent)
-export function route(request, {squeue, campaign}) -> {args: [...], note} | {wait: reason}
-export function forbidden(request) -> [names]   extra commands to block in jobs
-export function notify(alert, {campaign, exec}) optional: called once per new alert (§13); omit it for no notifications
-```
-
-`route` returns partition, account, QoS, nodes, tasks, CPUs, memory, time and GRES arguments. It may query live
-inventory for shared pools. The engine adds and owns `--hold`, `--parsable`, `--no-requeue`, `--job-name`,
-`--comment`, `--chdir` and `--output`, and rejects them if `route` returns them. Its `note` goes into provenance.
-
-## 17. Invariants and where they are enforced
-
-| Invariant | Mechanism |
-|---|---|
-| One controller per campaign | systemd instance + `flock --no-fork --nonblock`, checked by `arc run` itself |
-| Intent persisted before submit; uncertain never resubmitted | §8 step 2; §9 adopt-or-uncertain |
-| Provenance before the job can run | held submit; release only after study and ledger |
-| Immutable requests, retries get new ids | snapshot + hash on first sight; filename = id |
-| Exact source, config, hashes, seed, hypothesis, baseline, evaluation per attempt | `artifacts/<id>/` |
-| Every job id recorded at submission | receipt step + events + ledger line |
-| Budget counts pending and held jobs | `reserved` (§7) |
-| Jobs can't submit or cancel | static scan + PATH shims |
-| The controller cancels only this campaign's own jobs, and records why | `withdraw/<id>` → `scancel` only on an exact `squeue` token match; reason in record, events and ledger |
-| Prompts re-read every turn | composed per turn from files |
-| Ledger entry per transition | `events.jsonl` (+ optional `runs.md` lines) |
-| Only a human marks a conclusion Reviewed | `arc review` with the hash the human saw, in `control/reviews.jsonl` (same Unix user: convention, not permission) |
-| Fair measurement is visible | pinned evaluator label (§10) |
-
-## 18. Non-goals
-
-Never added: pilot gates; caps on turns, calls, jobs or job duration; model-turn timeouts; auditor approval steps;
-built-in notifications (files are the channel; a site may opt in with `notify`, §16); stopping rules the human didn't ask for; permanent failure after N
-retries.
-
-Not in v1: a separate project layer; validation of `ext`; a cross-campaign submit lock (the site's live inventory
-check is the guard); migrating live legacy campaigns; importing legacy state.
-
-## 19. Repository layout and size
-
-```
-bin/arc                      ~20   CLI entry
-src/cli.mjs                  ~200  verbs
-src/campaign.mjs             ~80   load and validate campaign.json, paths, registry
-src/request.mjs              ~100  FIELDS, validation, schema text for the prompt
-src/controller.mjs           ~250  tick: observe, scan, adopt, release, admit, turns, status
-src/slurm.mjs                ~80   sbatch/squeue/sacct/scontrol wrappers and parsing (injectable)
-src/freeze.mjs               ~90   archive, provenance, evaluator check, run.sh
-src/turns.mjs                ~150  cadence, prompt composition, launch, harvest
-src/agents.mjs               ~80   codex and claude adapters
-src/status.mjs               ~100  status and alerts
-prompts/worker.md  prompts/worker-checkin.md  prompts/auditor.md
-templates/campaign.json brief.md steering.md arc@.service site.example.mjs
-skills/arc-coordinator/SKILL.md     how an interactive session reads and steers a campaign
-docs/DESIGN.md quickstart.md
-test/fake-slurm.mjs  test/*.test.mjs
-```
-
-## 20. Tests
-
-The controller takes injected dependencies `{slurm, systemd, clock}`. Tests use an in-memory fake Slurm and real
-git in temporary repositories. Required cases:
-
-- crash after `sbatch` created the job, before the receipt → restart adopts it, no duplicate;
-- `sbatch` timeout without a job → `uncertain`, never resubmitted, GPUs stay reserved, other requests proceed;
-- definite `sbatch` error → retry with the same id; validation error → `rejected`;
-- budget with held, pending, uncertain and orphan jobs; priority order; same-priority backfill; lower priority
-  never overtakes;
-- dependencies: wait, then proceed or drop;
-- request mutation, duplicate id, file name ≠ id, unknown field;
-- crash between receipt and release → release happens, study and ledger written once;
-- deadline closes admission, preserves jobs, finishes cleanly;
-- evaluator unmodified vs modified;
-- claim parsing; audit and review attach by hash; an edited claim becomes `stale`; reused or missing ids are flagged;
-- PATH shims make `sbatch` fail inside `run.sh`;
-- turn harvest: success, failure with provider message, unit vanished; backoff schedule; cadence rules;
-- status: every key present, alerts clear when conditions resolve;
-- the auditor wakes on a completed run, sees its log and diff, and checks it once; old `advisor` names keep working
-  and an old-name turn runs read-only;
-- withdrawing a pending or running job cancels it, records the reason, frees the budget and drops its dependents; a
-  job the queue does not show under the request's token is never cancelled; an uncertain one raises
-  `withdraw_uncertain`;
-- SIGTERM → clean exit.
-
-Integration, run manually with explicit approval:
-
-- one 0-GPU CPU job through real Slurm on a throwaway campaign;
-- `start`, `restart` and `stop` under real systemd with a stub agent. Verify no leftover process, unit or lock
-  holder, and remove everything afterwards.
-
-## 21. Implementation plan
-
-1. **Core** against fake Slurm: requests, records, admission, submission, reconciliation, status, events, with the
-   tests above.
-2. **Freeze and site**: archive, provenance, evaluator check, `run.sh`, site loader and example; the real CPU smoke
-   job.
-3. **Turns**: adapters, systemd-run launch, harvest, cadence, prompt composition; tested with a stub agent (no
-   tokens).
-4. **CLI and unit**: all verbs, `arc@.service`, stop and restart verification.
-5. **Prompts and docs**: worker and auditor protocols, coordinator skill, quickstart. First real campaign: a fresh
-   campaign on a project with no live controller.
-
-Live campaigns on the legacy controllers are not touched. They finish or drain on their own controllers.
-
-## 22. Decision log
-
-| # | Decision | Source |
+| Class | Examples | Effect |
 |---|---|---|
-| 1 | Campaign directories live on scratch (`runs_root` in `site.mjs`) | user |
-| 2 | Two model roles; the controller is not an LLM; the advisor is optional | recommended, accepted |
-| 3 | "Register before release" = durable `study.json` (+ spool copy) written while held; no helper job | recommended, accepted |
-| 4 | The advisor audits claims against raw evidence with a fixed checklist; "no material issues" is a valid result | user request, design §12 |
-| 5 | Pinned evaluator, recorded as a label, not a gate | user |
-| 6 | `arc stop` preserves jobs; `--cancel-jobs` is explicit | recommended, accepted |
-| 7 | `deadline` is required: ISO time or `"none"` | recommended, accepted |
-| 8 | Priority, then first seen; lower never overtakes higher; same-priority backfill | recommended, accepted |
-| 9 | Uncertain: auto-adopt only an exact single match; never auto-abandon | recommended, accepted |
-| 10 | Turns as transient systemd user units | recommended, accepted |
-| 11 | `site.mjs` is local and never committed | user policy |
-| 12 | `blocked.md` channel from the worker | recommended, accepted |
-| 13 | No project layer; `ext` is free-form | recommended, accepted |
-| 14 | `findings.md` soft budget of 150 lines (nudge only) | recommended, accepted |
-| 15 | Human review is per claim (hash-bound, `arc review`); the job ledger is provenance only | user |
-| 16 | Enforce in code only what protects the record and the resources; agent behaviour is set by prompts (principle 8). The advisor report is passed to the worker unfiltered, as nonbinding | user |
-| 17 | `arc review` requires the claim hash shown by `arc claims` | review of arc v1 |
-| 18 | Advisor re-runs only for claim texts it has not answered; prompt carries per-request evidence; read-only git for the Claude advisor | review of arc v1 |
-| 19 | Unit uses `KillMode=mixed`; `arc run` checks it holds the lock; turn units named `arc-<id>.<role>-NNNN` | review of arc v1 |
-| 20 | Adoption always records the study and finishes terminal jobs; a queued request found in the queue is adopted, never resubmitted | review of arc v1 |
-| 21 | Only accepted, rejected, dropped and finished requests wake the worker; a job starting to run does not | user |
-| 22 | Busy-timer wake-ups with no news are short check-in turns, optionally with cheaper settings (worker.checkin) | user |
-| 23 | An infeasible procedure, gate or criterion in the brief never idles the campaign: the worker substitutes, labels it exploratory and carries on (prompt rule); briefs state priorities, not gates | review of the order-free-causal campaign, accepted by user |
-| 24 | Idle-timer wake-ups with no news back off: `idle_min` doubling to `idle_max_min` (default 240); any other turn resets | review of the order-free-causal campaign, accepted by user |
-| 25 | Notifications only through an optional `site.notify` hook, once per new alert; the engine sends nothing by default | user |
-| 26 | The advisor is renamed auditor; `advisor` stays accepted as an old name (config, turns state, pause marker, CLI); every non-worker role is read-only | user |
-| 27 | The auditor checks claims, metric gaming in the code diffs, and finished runs' logs; at most one suggestion, only as the fix for a cited issue; no repeats without new evidence | user, from the prior-work review |
-| 28 | The auditor also wakes on completed runs it has not checked (oldest first, 20 per turn), not only on changed claims | user |
-| 29 | Withdrawing a submitted request, pending or running, makes the controller cancel its job (exact token match, reason recorded); replaces "cancellation stays a human action" | user |
-| 30 | The human's interactive assistant may steer, pause, restart, reconcile and withdraw superseded or broken requests without asking; it asks before withdrawing a healthy running job, changing budget or deadline, or stopping. Agents never touch the controller, arc's code or its units, and never run scheduler commands on campaign jobs | user |
+| Permanent | any validation failure | `rejected`; the id is spent; the worker sees why |
+| Transient | git or tar failure or timeout, a release failure, a definite `sbatch: error` | Same state, retried after `min(60, 2^attempts)` minutes, forever |
+| Ambiguous | `sbatch` timed out or was killed, or the controller crashed while `submitting` | `uncertain` (see Reconciliation) |
+
+**Admission**, each tick unless STOP, PAUSE_SUBMISSIONS or the deadline applies. Queued requests go in order of
+effective priority (an `arc priority` override, else the request's own), then first seen, then id. A request waits for
+its retry time and for its `after` dependencies; it is dropped if a dependency was rejected or dropped, or ended other
+than `COMPLETED`. If its GPUs don't fit (`reserved + gpus > gpu_cap`) or `site.route` says wait, it waits, and so
+does every request of lower priority; requests at the same priority may backfill. `reserved` counts submitting,
+uncertain and unfinished submitted requests, plus orphan jobs. Shared pools across campaigns are the site's job, from
+live inventory.
+
+**Submission**, in order; each step is idempotent, so a crash anywhere is repaired by the next tick:
+
+1. **Freeze** into `artifacts/<id>/`: `git archive` of the commit, hashes of archive and script, the worktree's
+   uncommitted changes (recorded, never run), the evaluator label (§6), `request.json`, `provenance.json`, `run.sh`.
+2. **Record intent** (`submitting`).
+3. **Submit held**, tagged with the exact token `--comment=arc:<campaign>:<id>` and `--job-name=<prefix>-<id>`.
+4. **Record the receipt** (`submitted`, job id).
+5. **Record the study**: `study.json` (and a copy in `study_spool`, if set) and a ledger line.
+6. **Release.**
+
+Provenance therefore exists before a job can run, and a request is submitted at most once. `run.sh` exports
+`ARC_CAMPAIGN`, `ARC_REQUEST_ID`, `ARC_RUN_DIR`, `ARC_SOURCE`, `ARC_SEED` and `job_env`; sets thread counts from
+`SLURM_CPUS_PER_TASK`; puts failing shims for the scheduler commands first on PATH; extracts the source on the compute
+node, which keeps slow filesystem work out of the tick; runs the script from it; and on exit writes `execution.json`
+with the exit code, times and a hash of each expected output.
+
+**Reconciliation**, each tick:
+
+- **Observe.** `sacct` on unfinished jobs; a terminal state finishes the record and writes a ledger line.
+- **Adopt.** A `submitting` or `uncertain` request whose token appears exactly once in `squeue` (or whose job name
+  appears once in `sacct` since its intent) is adopted, study included; so is a queued request already in the queue,
+  which is never submitted twice. Otherwise it stays `uncertain`: its GPUs stay
+  reserved, it is never resubmitted, and it blocks only itself until `arc reconcile`.
+- **Cancel** withdrawn jobs (below).
+- **Release** anything submitted but not yet released.
+- **Orphans.** Jobs tagged `arc:<campaign>:` that match no record count against the budget and raise `orphan_job`.
+
+**Withdrawal.** The worker, or `arc withdraw`, writes `withdraw/<id>` with a reason. A queued request is dropped. A
+submitted one, pending or running, is cancelled by the controller, only if `squeue` shows its job under its exact
+token; it finishes `CANCELLED`, and the reason goes into its record, the events, the ledger and the worker's digest. A
+failed cancel is retried after 5 minutes. Requests that depend on it are then dropped. A `submitting` or `uncertain`
+request raises `withdraw_uncertain` and waits for `arc reconcile`. When to stop a running job is the worker's judgement
+(§8).
+
+## 6. Fair measurement
+
+Provenance shows what ran, not that it was measured fairly; the worker writes both the method and, by default, the code
+that scores it. Two layers make unfair measurement visible. They detect rather than prevent, since the worker runs as
+the same Unix user.
+
+- **Pinned evaluator (code).** `evaluator: {commit, paths}` pins the evaluation code and split definitions the human
+  vetted. At freeze time `git diff --quiet <pin> <commit> -- <paths>` labels the run `unmodified` or `modified` in its
+  provenance, study and ledger line. It is a label, not a gate. Headline claims cite unmodified runs; changing the pin
+  is the human's decision.
+- **Auditor (prompt).** Reads the code diffs for gaming the label cannot see (§8).
+
+## 7. Agent turns
+
+**Execution.** The controller writes `turns/<role>-NNNN.prompt.md`, records the turn as active, then starts it with
+`systemd-run --user --unit=arc-<campaign>.<role>-NNNN … arc turn`. Recording first means a crash can never run two
+turns at once; campaign ids cannot contain `.`, so `arc-<campaign>.*` matches only this campaign's units. The runner
+pipes the prompt into the agent CLI, saves the transcript, and writes the report (`.md`) and the exit record
+(`.exit.json`: ok, model, usage, error). Turns are not children of the controller, so a restart never touches them. A
+unit that is gone (systemd says inactive or failed) without an exit record is a failed turn.
+
+**Adapters** (`src/agents.mjs`). `codex exec`: the worker gets `danger-full-access` in its worktree, every other role a
+read-only sandbox. `claude --print`: the worker gets Bash, Read, Edit, Write, Glob and Grep; every other role gets Read,
+Glob, Grep and read-only `git show`, `git diff` and `git log`. Both roles share one credentials home unless a role sets
+`env`.
+
+**Cadence.** News is a request accepted, rejected, dropped or finished, or a change to the brief, the steering, the
+auditor's report or a review. A job starting to run is not news.
+
+| The worker is woken by | When | Turn |
+|---|---|---|
+| News | `changed_min` (2) after the last turn started | Full |
+| The idle timer: no job active, no news | `idle_min` (20), doubling after each such turn up to `idle_max_min` (240); any other turn resets it | Full |
+| The busy timer: jobs running, no news | `busy_min` (60) | Short check-in (`prompts/worker-checkin.md`), optionally with `worker.checkin` settings |
+| A failed turn | `min(60, 2^failures)` minutes after it, forever | Full |
+
+After the deadline only news wakes the worker. There are no turn timeouts and no caps. The auditor is due when
+`every_min` has passed and there is something it has not yet answered in a successful turn: a live claim without a
+valid audit, or a completed run it has not checked (oldest first, at most 20 per turn). The two roles run independently.
+
+**Prompt**, composed fresh every turn and archived: the role protocol from `prompts/` (the worker's includes the
+request schema), `site.prompt`, campaign facts (id, budget, deadline, base commit, paths, evaluator pin), the brief, the
+steering, and a digest: live status, queue, jobs, recent rejections, alerts, the role's own health, `blocked.md` and
+`findings.md` (with a nudge above 150 lines). The worker also gets each claim's audit and review state and the auditor's
+latest report; the auditor gets the claims and runs to check, with their evidence, and its own previous report.
+
+## 8. Agent protocols
+
+The prompts in `prompts/` are the source of truth; these are the design commitments they carry.
+
+**Worker** (`prompts/worker.md`):
+
+- Memory is files: `findings.md` is the current best answer, rewritten each turn, with claims in the §9 format and a
+  soft limit of 150 lines; `notes.md` is an append-only lab notebook; `blocked.md` tells the human about a blocker and
+  stops nothing.
+- A step in the brief that can't be carried out, or can't tell the arms apart, never idles the campaign: the worker
+  writes `blocked.md`, adopts the most defensible substitute, labels what depends on it exploratory and carries on.
+  "Fixed criteria" means criteria are not moved to flatter a result.
+- It stops a job through `withdraw/` when steering has superseded it or it is clearly broken, never to avoid a
+  disappointing result; a stopped run counts in "Variants tried".
+- It ends its turn while waiting for jobs, and commits only on its campaign branch: merging is the human's decision.
+
+**Auditor** (`prompts/auditor.md`) checks the work and never plans it. It reads raw evidence, never the worker's turn
+reports, and `notes.md` only for the worker's answers to its points. Three checks:
+
+1. **Claims.** Does the number match the artifact? Same protocol and denominator? Enough seeds for the effect? Evaluator
+   unmodified? Is a failed or discarded variant left out in a way that biases the claim? Could test data leak?
+2. **Metric gaming** in the code diffs: scoring, filtering or post-processing changed (inside or outside the pinned
+   paths), outputs dropped or selected before scoring, failures left out of the denominator, a changed panel, seed,
+   sample count or reference set, copied or hard-coded answers, disabled checks, a test panel reused for selection.
+3. **Finished runs**: NaN, loss or gradient-norm spikes, a late rise in validation loss, restart or out-of-memory loops,
+   code imported from outside `$ARC_SOURCE`, the wrong checkpoint or data, missing outputs. Running jobs belong to the
+   worker's check-ins, since the worker is the one who can act.
+
+It answers one line per claim, `C<n>: supported | unsupported | can't tell — <evidence>`, then `Material issues: none`
+or a list where each item cites a file, job id or number, then at most one `Suggestion:`, which must fix an issue it
+cited. "No material issues" is the expected result: every point costs the worker a turn, so only points that would
+change a claim or the next decision count, and none is repeated without new evidence. The worker acts on a point when it
+would change the current answer or its next decision, and otherwise declines in one line in `notes.md`. The audit flag
+rate in `status.json` is the calibration signal: near 100% means nagging, near 0% over many audits may mean
+rubber-stamping.
+
+## 9. Claims and review
+
+Review is per claim, not per job: a finished job says nothing about whether a conclusion is true, and a per-job review
+queue does not scale (one legacy notebook reached 15,000 unticked entries). A claim is a block in `findings.md` with a
+stable id:
+
+```
+### C3 — 2k warmup lowers final val loss by 0.03 ± 0.01 vs 500 steps
+Evidence: warmup-2k-seed1..3 vs warmup-500-seed1..3; artifacts/<id>/metrics.json
+Evaluator: unmodified
+Variants tried: 4
+```
+
+Ids are never reused; a retracted claim moves under `## Superseded`. Each tick the controller parses the claims and
+hashes each block. Audit verdicts and human reviews bind to that hash. `arc review <id> C3 accept|reject|needs-more
+--hash <h> -m "note"` takes the hash shown by `arc claims` and is refused if the claim changed since, so a verdict never
+binds to text the human did not read; once the worker edits a claim, its review stops counting. States: `new`,
+`audited`, `reviewed:accept|reject|needs-more`, `stale`, `superseded`. Only the human writes reviews, by convention.
+
+## 10. Status, ledger and alerts
+
+- **`status.json`** (schema `arc.status/2`) is rebuilt every tick with every key present: controller (pid, version,
+  heartbeat, phase), deadline, budget, counts, the queue with what each request waits for, active and recent jobs, each
+  role's health and next turn, `blocked`, claim counts and alerts. `arc status` reports the controller as dead if the
+  heartbeat is older than 3 minutes.
+- **`events.jsonl`** records every transition. If `ledger_md` is set, one plain line per submission and per finish is
+  appended to it; point it at a file only arc writes.
+- **Alerts** are derived each tick and clear themselves:
+
+| Code | Raised when |
+|---|---|
+| `uncertain_submission` | A submission's outcome is unknown; its GPUs stay reserved until it is resolved |
+| `orphan_job` | A campaign-tagged job matches no record; its GPUs count against the budget |
+| `request_mutated`, `bad_request_file` | A request file changed after first sight; a file in `requests/` is not `<id>.json` |
+| `withdraw_uncertain` | A withdrawal waits for an uncertain submission to be resolved |
+| `role_failing` | A role failed 3 or more turns in a row; carries the provider's message |
+| `controller_error` | The last tick, or a phase of it, threw |
+| `evaluator_modified` | An active run changed the pinned evaluator |
+| `findings_long` | `findings.md` is over 150 lines |
+| `blocked` | `blocked.md` is not empty |
+| `duplicate_claim_id` | A claim id appears more than once |
+
+- **Notifications** are opt-in. If `site.notify` exists, it is called once when an alert appears (keyed by code and
+  ids, kept in `state/notified.json`) and again only after the alert clears and returns. Its errors are logged, never
+  fatal. Without it, arc sends nothing: files are the channel.
+
+## 11. Process model
+
+- **Unit.** `arc@<id>.service`, rendered by `arc start`, runs `flock --no-fork --nonblock <lock> node arc run <id>`
+  with `Restart=on-failure` and `KillMode=mixed`: SIGTERM reaches only the controller, which finishes its current step,
+  so an sbatch is never cut off mid-flight. `arc run` refuses to start without holding the lock, so one controller runs
+  per campaign; run each campaign from one node only.
+- **Start** is the coordinator's step wherever cluster policy forbids agents from leaving services running; an assistant
+  prepares everything with `arc start --no-enable`.
+- **Restart.** `arc restart` restarts only the controller; turns and jobs continue. It is how a campaign picks up a new
+  arc version. Prompt changes need nothing, since prompts are read every turn.
+- **Stop.** `arc stop` writes STOP, stops the unit and the turn units, cancels jobs only with `--cancel-jobs`, then
+  checks that no unit or lock holder remains and reports what is left in Slurm.
+- **Finish.** After the deadline, once no job or turn is active and the worker has seen the latest news, the controller
+  marks the campaign `finished` and exits.
+
+## 12. Guarantees and non-goals
+
+| Guarantee | Mechanism |
+|---|---|
+| One controller per campaign | systemd instance and `flock`, checked by `arc run` |
+| A request is submitted at most once; an uncertain one is never resubmitted | Intent recorded before sbatch; adoption only on an exact token match |
+| Provenance exists before a job can run | Held submit; release only after the study and ledger line |
+| Requests are immutable; retries get new ids | Snapshot and hash on first sight; file name = id |
+| Exact source, settings, hashes, seed and purpose for every attempt | `artifacts/<id>/` |
+| The budget counts pending and held jobs | `reserved` (§5) |
+| Jobs cannot submit or cancel jobs | Static scan and PATH shims |
+| Only this campaign's jobs are cancelled, always with a recorded reason | `withdraw/` → cancel on an exact `squeue` token match |
+| Every transition is recorded | `events.jsonl` (and `ledger_md`) |
+| A verdict binds to the text the human read | `arc review --hash` |
+| Unfair measurement is visible | Evaluator label (§6) and the auditor (§8) |
+
+**Never added** (each was tried or proposed in the legacy campaigns and rejected): pilot or go/no-go gates; caps on
+turns, calls, jobs or job duration; turn timeouts; approval steps by the auditor; stopping rules the human did not ask
+for; permanent failure after N retries; built-in notifications.
+
+**Not yet**: a project layer above campaigns; validation of `ext`; a cross-campaign submit lock (the site's live
+inventory is the guard); importing legacy campaigns.
+
+## 13. Code map
+
+| Path | Responsibility |
+|---|---|
+| `bin/arc`, `src/cli.mjs` | The CLI; `arc help` lists every verb |
+| `src/controller.mjs` | The tick: observe, scan, reconcile, cancel, release, admit, turns, status, notify |
+| `src/request.mjs` | `FIELDS`: request validation and the worker's schema text |
+| `src/freeze.mjs` | Archive, provenance, evaluator label, `run.sh` |
+| `src/slurm.mjs` | The only module that calls the scheduler |
+| `src/turns.mjs`, `src/agents.mjs` | Cadence, prompts, launch, harvest and the turn runner; the Codex and Claude adapters |
+| `src/claims.mjs`, `src/status.mjs` | Claims, audits and reviews; status and alerts |
+| `src/campaign.mjs` | `campaign.json`, paths, registry, site loading |
+| `src/systemd.mjs`, `src/git.mjs`, `src/fsutil.mjs` | systemd, git and atomic-file helpers |
+| `prompts/` | Worker, worker check-in and auditor protocols |
+| `templates/` | `campaign.json`, `brief.md`, `steering.md`, `arc@.service`, `site.example.mjs` |
+| `skills/arc-coordinator/` | How an assistant session reads and operates a campaign |
+
+`npm test` runs the controller against an in-memory fake Slurm, real git in temporary repositories and a stub agent: no
+jobs, no tokens. Checks against real Slurm and real systemd are run by hand, with approval.

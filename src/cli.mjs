@@ -1,4 +1,4 @@
-// arc command line. Every verb writes only human-owned files (control/, steering.md, withdraw/) or calls systemd.
+// arc command line. Verbs act through the files the controller reads (control/, steering.md, withdraw/) or systemd.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';

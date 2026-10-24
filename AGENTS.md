@@ -17,5 +17,7 @@ rules text) live in one file: `~/.config/arc/site.mjs`, or the path in `$ARC_SIT
 
 - Code enforces only what protects the record and the resources; agent behaviour belongs in `prompts/` (DESIGN.md §2,
   principle 8). Weigh every new rule against that line.
-- When a design choice changes, update DESIGN.md and add a row to its decision log (§22).
+- When a design choice changes, update DESIGN.md to describe the new design and append a row to
+  [docs/decisions.md](docs/decisions.md). DESIGN.md holds the current design only: each concept in one section, pointing
+  to the code (`FIELDS`, `arc help`) rather than copying it.
 - The tests run against a fake Slurm and a stub agent: they submit no jobs and spend no tokens.

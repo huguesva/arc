@@ -59,7 +59,7 @@ export function route(r, ctx) {
 
 // Optional notifications. Without notify() arc sends nothing and files stay the channel. If exported, it is called once
 // when an alert first appears (again only after it clears and returns), with {campaign, code, message, ids}. Keep it
-// fast: errors are logged as notify_error and ignored. Alert codes are listed in docs/DESIGN.md §13.
+// fast: errors are logged as notify_error and ignored. Alert codes are listed in docs/DESIGN.md §10.
 //
 // export function notify(alert, ctx) {
 //   if (!['blocked', 'role_failing', 'controller_error', 'uncertain_submission'].includes(alert.code)) return;
